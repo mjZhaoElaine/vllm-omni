@@ -50,6 +50,17 @@ def test_transcribe_defaults_to_auto_language(monkeypatch):
     assert captured.get("language") is None
 
 
+def test_transcribe_does_not_request_word_timestamps(monkeypatch):
+    # The helper returns the transcript text only, so asking for word timestamps
+    # buys nothing and costs a DTW alignment pass per segment -- expensive on the
+    # single-GPU runners, where whisper falls back to CPU.
+    captured = _stub_transcribe(monkeypatch)
+
+    media._whisper_transcribe_in_current_process("/tmp/does-not-matter.wav", "small")
+
+    assert not captured.get("word_timestamps")
+
+
 def test_bytes_entrypoint_forwards_language_to_subprocess(monkeypatch, tmp_path):
     """Cover the two hops the tests above skip: bytes -> file -> executor.submit.
 

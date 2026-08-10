@@ -684,7 +684,12 @@ def _whisper_transcribe_in_current_process(
         text = model.transcribe(
             output_path,
             temperature=0.0,
-            word_timestamps=True,
+            # No word_timestamps: this helper returns ``["text"]`` and nothing
+            # else, so the per-segment DTW alignment that flag runs is computed
+            # and thrown away. The alignment is post-hoc and does not feed
+            # decoding, so the text is identical either way -- it only costs
+            # time, which is worst on the single-GPU runners where whisper
+            # falls back to CPU.
             condition_on_previous_text=False,
             # None keeps whisper's auto-detection. Do not default this to a
             # language: callers include non-English audio tests.
