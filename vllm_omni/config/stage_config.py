@@ -203,6 +203,9 @@ class StagePipelineConfig:
     # by ``stage_init_utils._resolve_model_tokenizer_paths``.
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
+    # Whether the non-async path waits for a complete upstream payload from
+    # the model-runner connector before scheduling this stage.
+    requires_full_payload_input: bool = False
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -390,6 +393,7 @@ class StageDeployConfig:
     dlo_resident_layers: int | None = None
     host_weight_runtime_mode: str | None = None
     host_weight_runtime_root: str | None = None
+    dlo_host_registration_limit_gib: float | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 
@@ -856,9 +860,10 @@ def _build_engine_args(
         engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
-    # Topology-owned capability: apply after deploy/engine_extras so runtime
-    # knobs cannot override replay semantics.
+    # Topology-owned capabilities: apply after deploy/engine_extras so runtime
+    # knobs cannot override replay or transport semantics.
     engine_args["recompute_preemption"] = ps.recompute_preemption
+    engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
     return engine_args
 
 
