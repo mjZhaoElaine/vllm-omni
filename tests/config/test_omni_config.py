@@ -304,6 +304,13 @@ def test_from_pipeline_config_rejects_recompute_preemption_capability_overrides(
         )
 
 
+def test_from_pipeline_config_projects_topology_recompute_preemption() -> None:
+    omni_config = _from_pipeline_key("qwen3_tts")
+
+    assert omni_config.stage_by_id(0).model_config.recompute_preemption == "fail"
+    assert omni_config.stage_by_id(1).model_config.recompute_preemption == "allow"
+
+
 @pytest.mark.parametrize(
     ("cli_overrides", "stage_id"),
     [
@@ -630,6 +637,7 @@ def test_sub_config_fields_match_structured_scopes():
         "model_subdir",
         "tokenizer_subdir",
         "requires_full_payload_input",
+        "recompute_preemption",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)
