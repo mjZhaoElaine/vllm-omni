@@ -105,8 +105,8 @@ in the token/KV stream**. Declare `recompute_preemption="fail"` on the AR codec 
 Use the default `allow` only when a single sampled token per step fully determines the
 next KV input **and** no hidden side state is required to continue generation. When in
 doubt, prefer `fail`: the scheduler terminates with one explicit error instead of
-delivering spliced audio. Deploy YAML cannot override this field — it is applied last in
-`_build_engine_args()`.
+delivering spliced audio. Deploy YAML, `--stage-overrides`, and per-stage CLI runtime
+overrides cannot change this field.
 
 See [vllm-project/vllm-omni#6179](https://github.com/vllm-project/vllm-omni/issues/6179)
 for the failure mode this prevents.

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from pydantic.fields import FieldInfo
+from transformers import Qwen3OmniMoeConfig
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
 from vllm.config import LoadConfig as VllmLoadConfig
@@ -699,7 +700,9 @@ def test_stage_pipeline_config_defaults_recompute_preemption_to_allow() -> None:
     ],
 )
 def test_native_ar_tts_pipelines_declare_fail_recompute_preemption(model_type, stage_ids) -> None:
-    pipeline = resolve_pipeline_config(model_type)
+    # qwen3_omni_moe is a resolver: without HF config it returns None.
+    hf_config = Qwen3OmniMoeConfig(enable_audio_output=True) if model_type == "qwen3_omni_moe" else None
+    pipeline = resolve_pipeline_config(model_type, hf_config)
     assert pipeline is not None
     for stage_id in stage_ids:
         stage = pipeline.get_stage(stage_id)
@@ -718,3 +721,20 @@ def test_deploy_engine_extras_cannot_override_recompute_preemption() -> None:
     gepard_deploy.stages[0].engine_extras["recompute_preemption"] = "allow"
     merged_gepard = merge_pipeline_deploy(GEPARD_PIPELINE, gepard_deploy)
     assert merged_gepard[0].yaml_engine_args["recompute_preemption"] == "fail"
+
+
+@pytest.mark.parametrize("source", ["direct", "stage-overrides"])
+def test_stage_runtime_overrides_cannot_override_recompute_preemption(source: str) -> None:
+    """``--stage-overrides '{"0": {"recompute_preemption": "allow"}}'`` becomes
+    ``stage_0_recompute_preemption`` and is applied in ``to_omegaconf()`` after
+    topology projection. The fail declaration must still win.
+    """
+    gepard_deploy = load_deploy_config(_DEPLOY_DIR / "gepard.yaml")
+    merged = merge_pipeline_deploy(GEPARD_PIPELINE, gepard_deploy)
+    if source == "direct":
+        runtime_overrides = {"recompute_preemption": "allow"}
+    else:
+        runtime_overrides = build_stage_runtime_overrides(0, {"stage_0_recompute_preemption": "allow"})
+    merged[0].runtime_overrides = runtime_overrides
+    cfg = merged[0].to_omegaconf()
+    assert cfg.engine_args.recompute_preemption == "fail"

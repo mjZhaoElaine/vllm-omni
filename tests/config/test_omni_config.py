@@ -275,6 +275,36 @@ def test_from_pipeline_config_rejects_full_payload_input_capability_overrides(
 
 
 @pytest.mark.parametrize(
+    ("engine_extras", "cli_overrides"),
+    [
+        ({"recompute_preemption": "allow"}, {}),
+        ({}, {"stage_0_recompute_preemption": "allow"}),
+    ],
+    ids=["deploy", "stage-cli"],
+)
+def test_from_pipeline_config_rejects_recompute_preemption_capability_overrides(
+    engine_extras,
+    cli_overrides,
+):
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                engine_extras=engine_extras,
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match=r"no structured config owner: recompute_preemption"):
+        VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            user_deploy_config=deploy,
+            cli_overrides=cli_overrides,
+        )
+
+
+@pytest.mark.parametrize(
     ("cli_overrides", "stage_id"),
     [
         ({"kv_cache_dtype": "fp8"}, 0),
