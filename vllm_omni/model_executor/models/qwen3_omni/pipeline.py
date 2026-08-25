@@ -59,6 +59,7 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [2150],
             },
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=2,

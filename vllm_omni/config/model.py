@@ -1,5 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import MISSING, field
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ConfigDict, TypeAdapter
 from vllm.config import ModelConfig
@@ -122,6 +125,7 @@ class OmniModelConfig(ModelConfig):
     stage_id: int = 0
     async_chunk: bool = False
     retains_state_across_chunks: bool = False
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
     duplex_max_sessions: int = 1
