@@ -69,7 +69,7 @@ EXPECTED_MODEL_TYPES = {
     "step_audio2",
     "indextts2",
     "indextts2_5",
-    "dots_tts",
+    "gepard",
 }
 
 
