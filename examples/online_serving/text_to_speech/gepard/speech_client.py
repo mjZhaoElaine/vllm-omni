@@ -39,7 +39,9 @@ def run_tts(args) -> None:
     if args.stream:
         payload["stream"] = True
         payload["stream_format"] = "audio"
-        payload["response_format"] = "pcm"
+        if args.response_format not in ("pcm", "wav"):
+            print(f"Note: streaming requires pcm/wav; overriding --response-format {args.response_format} to 'pcm'")
+            payload["response_format"] = "pcm"
 
     print(f"Model: {args.model}")
     print(f"Text: {args.text}")
@@ -55,7 +57,7 @@ def run_tts(args) -> None:
     }
 
     if args.stream:
-        output_path = args.output or "output.pcm"
+        output_path = args.output or ("output.wav" if payload["response_format"] == "wav" else "output.pcm")
         with httpx.Client(timeout=300.0) as client:
             with client.stream("POST", api_url, json=payload, headers=headers) as resp:
                 if resp.status_code != 200:

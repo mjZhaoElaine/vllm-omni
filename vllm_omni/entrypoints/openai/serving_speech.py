@@ -473,7 +473,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._voxcpm2_tokenizer = None
         # Per-request output policy from the adapter's PreparedRequest. Keyed
         # by request_id so concurrent speech requests cannot overwrite each
-        # other. Consumed by the non-streaming accumulator.
+        # other. Stored only for non-streaming requests and consumed (popped)
+        # by the non-streaming accumulator in `_generate_audio_bytes`.
         self._speech_output_policies: dict[str, OutputPolicy] = {}
         self._audex_tokenizer = None
         self._audex_tta_rvq = None
@@ -3002,7 +3003,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = prepared.tts_params
             model_type = prepared.model_type
             qwen3_ref_audio_warmup_artifact_key = prepared.warmup_artifact_key
-            self._speech_output_policies[request_id] = prepared.output_policy
+            output_policy = prepared.output_policy
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
@@ -3024,7 +3025,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             tts_params = {}
             prompt = {"prompt": request.input}
-            self._speech_output_policies[request_id] = OutputPolicy()
+            output_policy = OutputPolicy()
 
         if model_type is None:
             if self._is_tts:
@@ -3105,6 +3106,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             qwen3_ref_audio_warmup_artifact_key,
             x_vector_only=self._tts_x_vector_only(tts_params),
         )
+        # Only the non-streaming path consumes output policies (in
+        # `_generate_audio_bytes`); streaming never reads them. Store late —
+        # after every fallible step above — and skip streaming requests
+        # entirely, so no caller has to discard entries (request ids are
+        # unique per request, so a stranded entry would never be reclaimed).
+        if not request.is_streaming():
+            self._speech_output_policies[request_id] = output_policy
         return request_id, generator, tts_params
 
     async def _generate_pcm_chunks(
@@ -3129,7 +3137,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
         """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
         request_id, generator, _ = await self._prepare_speech_generation(request)
-        getattr(self, "_speech_output_policies", {}).pop(request_id, None)
         try:
             async for chunk in self._generate_pcm_chunks(generator, request_id):
                 yield chunk
@@ -3532,7 +3539,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
                 media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
                 _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
-                getattr(self, "_speech_output_policies", {}).pop(request_id, None)
                 return StreamingResponse(
                     self._generate_audio_chunks(
                         generator,
@@ -3553,7 +3559,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     return error
 
                 _, generator, sse_tts_params = await self._prepare_speech_generation(request, request_id=request_id)
-                getattr(self, "_speech_output_policies", {}).pop(request_id, None)
                 return StreamingResponse(
                     self._generate_audio_sse_events(
                         generator,
