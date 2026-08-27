@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 import pytest
 import requests

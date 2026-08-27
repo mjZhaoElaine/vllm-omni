@@ -241,7 +241,8 @@ def test_gepard_mocked_engine_encodes_response_formats(gepard_server, response_f
     )
     assert isinstance(audio, (bytes, str))
     assert len(audio) > 0
-    assert response_format in media_type or media_type.startswith("audio/")
+    expected_media_type = {"wav": "audio/wav", "pcm": "audio/pcm", "flac": "audio/flac", "mp3": "audio/mpeg"}
+    assert media_type == expected_media_type[response_format]
 
 
 def test_gepard_streaming_rejects_non_pcm_wav() -> None:
