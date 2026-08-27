@@ -405,6 +405,9 @@ class OmniStageModelConfig:
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
     requires_full_payload_input: bool = False
+    # Topology-owned mirror of StagePipelineConfig.recompute_preemption.
+    # Projected in _build_model_config; not an engine-override owner. The
+    # scheduler still reads OmniModelConfig until RFC #4021 consumers switch.
     recompute_preemption: Literal["allow", "fail"] = "allow"
 
 
