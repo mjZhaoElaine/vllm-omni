@@ -89,6 +89,7 @@ def _make_scheduler(*, policy: str) -> OmniARScheduler:
     scheduler.chunk_transfer_adapter = None
     scheduler.input_coordinator = None
     scheduler._pending_recompute_preemption_error_requests = []
+    scheduler._apply_recompute_preemption_fail = True
     scheduler.finished_req_ids = set()
     scheduler.finished_req_ids_dict = defaultdict(set)
     scheduler.encoder_cache_manager = MagicMock()
@@ -267,3 +268,25 @@ def test_fail_discards_in_flight_async_output(monkeypatch: pytest.MonkeyPatch) -
     OmniARScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
 
     assert update_calls == []
+
+
+def test_reset_prefix_cache_does_not_use_fail_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = _Request("req-reset")
+    scheduler = _make_scheduler(policy="fail")
+    upstream_calls: list[str] = []
+
+    def fake_preempt(self, req, timestamp, drop_stale_output=False):
+        upstream_calls.append(req.request_id)
+
+    def fake_reset(self, *args, **kwargs):
+        OmniARScheduler._preempt_request(scheduler, request, timestamp=0.0)
+        return True
+
+    monkeypatch.setattr(ar_sched_mod.VLLMScheduler, "_preempt_request", fake_preempt)
+    monkeypatch.setattr(ar_sched_mod.VLLMScheduler, "reset_prefix_cache", fake_reset)
+
+    assert OmniARScheduler.reset_prefix_cache(scheduler, reset_running_requests=True) is True
+    assert upstream_calls == ["req-reset"]
+    assert scheduler._pending_recompute_preemption_error_requests == []
+    assert request.stop_reason is None
+    assert scheduler._apply_recompute_preemption_fail is True

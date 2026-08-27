@@ -28,7 +28,7 @@ from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
-from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
@@ -79,6 +79,31 @@ if TYPE_CHECKING:
         DuplexSessionRuntimeState,
     )
     from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+
+
+def _processed_output_error_text(output: Any) -> str | None:
+    """Return a client-visible error string for a processed stage output.
+
+    ``OmniRequestOutput.error`` is the explicit path. A finished
+    ``finish_reason=error`` completion is the scheduler fail-contract path:
+    it never sets ``.error``, so non-final stages would otherwise skip
+    ``_handle_stage_error`` and leave downstream async-chunk stages waiting.
+    """
+    error = getattr(output, "error", None)
+    if error:
+        return str(error)
+    if not getattr(output, "finished", False):
+        return None
+    completions = getattr(output, "outputs", None) or ()
+    if not completions:
+        return None
+    finish_reason = getattr(completions[0], "finish_reason", None)
+    if finish_reason not in (FinishReason.ERROR, "error"):
+        return None
+    stop_reason = getattr(completions[0], "stop_reason", None)
+    if stop_reason is None:
+        return "stage request failed"
+    return str(stop_reason)
 
 
 def _build_terminal_empty_output(
@@ -1065,7 +1090,11 @@ class Orchestrator:
                 )
                 continue
 
-            if getattr(output, "error", None) is not None:
+            error_text = _processed_output_error_text(output)
+            explicit_error = getattr(output, "error", None) is not None
+            if error_text is not None and (explicit_error or not pool.final_output):
+                if not explicit_error:
+                    output = OmniRequestOutput.from_error(output.request_id, error_text)
                 await self._handle_stage_error(stage_id, output)
                 continue
 

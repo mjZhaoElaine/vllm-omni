@@ -113,6 +113,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
         self._pending_recompute_preemption_error_requests: list[Request] = []
+        self._apply_recompute_preemption_fail = True
 
     def _recompute_preemption_policy(self) -> str:
         return getattr(self.vllm_config.model_config, "recompute_preemption", "allow")
@@ -124,7 +125,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return confirmed > request.num_prompt_tokens
 
     def _should_fail_recompute_preemption(self, request: Request) -> bool:
-        return self._recompute_preemption_policy() == "fail" and self._request_has_decode_progress(request)
+        return (
+            getattr(self, "_apply_recompute_preemption_fail", True)
+            and self._recompute_preemption_policy() == "fail"
+            and self._request_has_decode_progress(request)
+        )
+
+    def reset_prefix_cache(self, *args: Any, **kwargs: Any) -> Any:
+        """Prefix-cache reset shares ``_preempt_request`` but is not KV pressure.
+
+        Disable the fail contract for this call so a user-initiated reset does
+        not terminate live requests with the recompute-preemption message.
+        """
+        previous = getattr(self, "_apply_recompute_preemption_fail", True)
+        self._apply_recompute_preemption_fail = False
+        try:
+            return super().reset_prefix_cache(*args, **kwargs)
+        finally:
+            self._apply_recompute_preemption_fail = previous
 
     def _preempt_request(
         self,
