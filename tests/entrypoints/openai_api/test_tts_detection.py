@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """TTS model detection: registry-driven stage -> model-type resolution.
 
 ``serving_speech.py`` used to carry a hand-written 20-branch ladder mapping
@@ -144,6 +145,7 @@ _PIPELINE_STAGES = [
     "dit",
     "fish_speech_slow_ar",
     "fused_thinker_talker",
+    "gepard",
     "glm_tts",
     "glm_tts_dit",
     "higgs_audio_v2",

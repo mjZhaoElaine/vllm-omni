@@ -6,6 +6,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 - **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
+- **Gepard-1.0** (`nineninesix/gepard-1.0`) -- single-stage native-AR TTS with a 22.05 kHz NanoCodec. Zero-shot default voice only.
 
 See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, and MOSS-TTS-Nano.
 
@@ -40,6 +41,10 @@ vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8091
 # CosyVoice3 (voice cloning only — supply ref_audio + ref_text per request)
 vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
     --omni --port 8091 --trust-remote-code
+
+# Gepard-1.0 (zero-shot default voice; packaged gepard.yaml)
+vllm-omni serve nineninesix/gepard-1.0 --omni --port 8091 --trust-remote-code \
+    --deploy-config vllm_omni/deploy/gepard.yaml
 ```
 
 ### Generate Speech
@@ -95,7 +100,7 @@ response.stream_to_file("output.wav")
 
 ### Endpoint
 
-```
+```http
 POST /v1/audio/speech
 Content-Type: application/json
 ```
@@ -204,7 +209,7 @@ The `usage` object on `speech.audio.done` is the same shape returned per item by
 
 ### Voices Endpoint
 
-```
+```http
 GET /v1/audio/voices
 ```
 
@@ -229,7 +234,7 @@ Lists available voices for the loaded model.
 
 `uploaded_voices` is always present (empty list when no custom voices have been uploaded). Fields `ref_text` and `speaker_description` are omitted per-entry when not provided at upload time.
 
-```
+```http
 POST /v1/audio/voices
 Content-Type: multipart/form-data
 ```
@@ -528,7 +533,7 @@ The batch endpoint synthesizes multiple texts in a single request, returning all
 
 ### Endpoint
 
-```
+```http
 POST /v1/audio/speech/batch
 Content-Type: application/json
 ```
@@ -734,6 +739,28 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | Model | Description |
 |-------|-------------|
 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | Voice cloning from `ref_audio` + `ref_text`. No built-in voice presets — upload a voice or pass `ref_audio`/`ref_text` per request. |
+
+### Gepard-1.0
+
+| Model | Description |
+|-------|-------------|
+| `nineninesix/gepard-1.0` | Zero-shot native-AR TTS. 22.05 kHz mono. `voice` must be omitted or `"default"`. |
+
+Gepard request fields:
+
+| Field | Behavior |
+|---|---|
+| `input` | Required. Empty/whitespace-only returns 400. |
+| `voice` | Omitted or `"default"` only. Other values 400. |
+| `response_format` | `wav` default. Non-streaming: `wav`/`pcm`/`flac`/`mp3`. `opus` returns 400 (22.05 kHz is not an Opus sample rate). Streaming: `pcm`/`wav` only. |
+| `stream` / `stream_format` | SSE (`speech.audio.*`) and raw `audio` byte streaming. |
+| `speed` | Must be `1.0`. Gepard has no native speed control. |
+| `max_new_tokens` | Frame budget (1 token = 1 frame = 1024 samples ≈ 46.4 ms). Default 1000 from deploy YAML; adapter bounds 1..4096. |
+| `seed` | Optional. Reaches the in-model 32-head sampler. The packaged YAML currently pins `seed: 42`, so serving is deterministic by default until that pin is removed. |
+| `extra_params` | Any key returns 400, including `temperature`/`top_p`/`top_k`. |
+| Cloning / style fields | `ref_audio`, `ref_text`, `speaker_embedding`, `instructions`, `language`, `task_type`, `word_timestamps`, and similar declared-but-unsupported fields return 400. |
+
+See the [Gepard section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#gepard-10) for launch commands. Native-AR recompute preemption is a known limitation under concurrency.
 
 ### OmniVoice
 

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import base64
 import hashlib
@@ -52,6 +55,7 @@ from vllm_omni.entrypoints.openai.speech_usage import (
     qwen3_tts_input_token_details,
 )
 from vllm_omni.entrypoints.openai.tts_adapters import (
+    OutputPolicy,
     SpeechServingContext,
     all_tts_stage_keys,
     detect_tts_model_type,
@@ -467,6 +471,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         self._tts_tokenizer = None
         self._voxcpm2_tokenizer = None
+        # Per-request output policy from the adapter's PreparedRequest. Keyed
+        # by request_id so concurrent speech requests cannot overwrite each
+        # other. Consumed by the non-streaming accumulator.
+        self._speech_output_policies: dict[str, OutputPolicy] = {}
         self._audex_tokenizer = None
         self._audex_tta_rvq = None
         self._voxcpm2_split_map: dict[int, list[int]] = {}
@@ -2994,6 +3002,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = prepared.tts_params
             model_type = prepared.model_type
             qwen3_ref_audio_warmup_artifact_key = prepared.warmup_artifact_key
+            self._speech_output_policies[request_id] = prepared.output_policy
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
@@ -3015,6 +3024,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             tts_params = {}
             prompt = {"prompt": request.input}
+            self._speech_output_policies[request_id] = OutputPolicy()
 
         if model_type is None:
             if self._is_tts:
@@ -3119,6 +3129,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
         """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
         request_id, generator, _ = await self._prepare_speech_generation(request)
+        getattr(self, "_speech_output_policies", {}).pop(request_id, None)
         try:
             async for chunk in self._generate_pcm_chunks(generator, request_id):
                 yield chunk
@@ -3145,13 +3156,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         artifact_ready = False
 
         try:
-            # MOSS-TTS-Nano emits delta chunks per yield (single-stage,
-            # async_chunk=false). The engine surfaces each yield as its own
-            # RequestOutput, so we need to accumulate across the async-for loop —
-            # final_output alone only carries the last (often empty) sentinel.
-            is_moss = self._tts_model_type == "moss_tts_nano"
-            moss_chunks: list[Any] = []
-            moss_sample_rate: int | None = None
+            # Sparse-audio models (MOSS-TTS-Nano, Gepard) emit delta chunks per
+            # yield with async_chunk=false. The engine surfaces each yield as its
+            # own RequestOutput, so we accumulate across the async-for loop when
+            # the adapter asks for it — final_output alone may only carry the
+            # last (often empty) sentinel. Prefer the engine's own concatenated
+            # waveform when FINAL_ONLY already produced one.
+            accumulate_nonstreaming = (
+                getattr(self, "_speech_output_policies", {}).pop(request_id, OutputPolicy()).accumulate_nonstreaming
+            )
+            delta_chunks: list[Any] = []
+            delta_sample_rate: int | None = None
 
             final_output: OmniRequestOutput | None = None
             # Non-streaming is FINAL_ONLY, so the stage-0 output carries the full
@@ -3171,7 +3186,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     _, audio_key = self._extract_audio_output(res)
                     if audio_key is not None:
                         audio_res = res
-                if not is_moss:
+                if not accumulate_nonstreaming:
                     continue
                 try:
                     step_audio, step_key = self._extract_audio_output(res)
@@ -3183,11 +3198,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 candidates = chunk if isinstance(chunk, list) else [chunk]
                 for cand in candidates:
                     if hasattr(cand, "numel") and cand.numel() > 0:
-                        moss_chunks.append(cand)
+                        delta_chunks.append(cand)
                 sr_step = step_audio.get("sr")
                 if sr_step is not None:
                     sr_val_step = sr_step[-1] if isinstance(sr_step, list) and sr_step else sr_step
-                    moss_sample_rate = int(sr_val_step.item()) if hasattr(sr_val_step, "item") else int(sr_val_step)
+                    delta_sample_rate = int(sr_val_step.item()) if hasattr(sr_val_step, "item") else int(sr_val_step)
 
             if final_output is None:
                 raise ValueError("No output generated from the model.")
@@ -3217,7 +3232,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
             sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
-            if is_moss:
+            if accumulate_nonstreaming:
                 # Prefer the engine's own consolidated audio when present. After the
                 # vllm 0.20 rebase non-stream requests resolve to FINAL_ONLY, so
                 # final_output already carries the full concatenated waveform; the
@@ -3233,12 +3248,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
                 if final_audio is not None:
                     audio_tensor = final_audio
-                elif moss_chunks:
-                    audio_tensor = torch.cat(moss_chunks, dim=-1)
+                elif delta_chunks:
+                    audio_tensor = torch.cat(delta_chunks, dim=-1)
                 else:
                     audio_tensor = np.zeros((0,), dtype=np.float32)
-                if moss_sample_rate is not None:
-                    sample_rate = moss_sample_rate
+                if delta_sample_rate is not None:
+                    sample_rate = delta_sample_rate
             elif isinstance(audio_tensor, list):
                 async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
                 if async_chunk:
@@ -3517,6 +3532,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
                 media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
                 _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
+                getattr(self, "_speech_output_policies", {}).pop(request_id, None)
                 return StreamingResponse(
                     self._generate_audio_chunks(
                         generator,
@@ -3537,6 +3553,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     return error
 
                 _, generator, sse_tts_params = await self._prepare_speech_generation(request, request_id=request_id)
+                getattr(self, "_speech_output_policies", {}).pop(request_id, None)
                 return StreamingResponse(
                     self._generate_audio_sse_events(
                         generator,
