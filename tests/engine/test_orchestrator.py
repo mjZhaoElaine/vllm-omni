@@ -2088,6 +2088,57 @@ async def test_non_final_stage_error_finish_aborts_downstream_stages() -> None:
 
 
 @pytest.mark.asyncio
+async def test_visible_non_tail_stage_error_finish_aborts_downstream_stages() -> None:
+    """MiMo-shaped topology: stage 0 is client-visible and still has a downstream.
+
+    ``final_output`` means the stage emits user-visible content, not that it is
+    the pipeline tail. A fail-contract finish on stage 0 must abort stage 1.
+    """
+    stage0 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="text")
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=stage_pools,
+        async_chunk=True,
+    )
+    req_id = "req-mimo-fail"
+    orchestrator.request_states[req_id] = OrchestratorRequestState(
+        request_id=req_id,
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+        final_output_stage_ids={0, 1},
+    )
+    assert stage_pools[0].select_replica_id(req_id) == 0
+    assert stage_pools[1].select_replica_id(req_id) == 0
+
+    output = _build_request_output(
+        req_id,
+        finish_reason="error",
+        stop_reason=RECOMPUTE_PREEMPTION_FAIL_MESSAGE,
+    )
+
+    await orchestrator._handle_processed_outputs(0, 0, [output])
+
+    error = orchestrator.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.request_id == req_id
+    assert error.error == RECOMPUTE_PREEMPTION_FAIL_MESSAGE
+    assert stage0.abort_calls == [[req_id]]
+    assert stage1.abort_calls == [[req_id]]
+    assert req_id not in orchestrator.request_states
+
+
+@pytest.mark.asyncio
 async def test_final_stage_error_finish_still_routes_as_output() -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=True)
     stage_pools = _build_stage_pools(
