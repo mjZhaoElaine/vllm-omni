@@ -222,6 +222,55 @@ def test_fail_prefill_only_still_allows_upstream_preempt(monkeypatch: pytest.Mon
     assert upstream_calls == ["req-prefill"]
 
 
+def test_fail_empty_output_one_placeholder_is_decode_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Async first-decode window: last prefill dispatched, one placeholder reserved."""
+    request = _Request("req-async-first-decode")
+    request.output_token_ids = []
+    request._output_token_ids = []
+    request.num_computed_tokens = request.num_prompt_tokens
+    request.num_output_placeholders = 1
+    scheduler = _make_scheduler(policy="fail")
+    scheduler.requests = {request.request_id: request}
+    finish_calls: list[tuple[list[str], RequestStatus]] = []
+
+    def fake_finish(self, request_ids, finished_status):
+        ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
+        finish_calls.append((ids, finished_status))
+        request.status = finished_status
+        return [request]
+
+    monkeypatch.setattr(ar_sched_mod.VLLMScheduler, "finish_requests", fake_finish)
+
+    OmniARScheduler._preempt_request(scheduler, request, timestamp=0.0)
+
+    assert finish_calls == [(["req-async-first-decode"], RequestStatus.FINISHED_ERROR)]
+    assert request.stop_reason == RECOMPUTE_PREEMPTION_FAIL_MESSAGE
+
+
+def test_fail_confirmed_past_prompt_without_output_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = _Request("req-confirmed")
+    request.output_token_ids = []
+    request._output_token_ids = []
+    request.num_computed_tokens = request.num_prompt_tokens + 1
+    request.num_output_placeholders = 0
+    scheduler = _make_scheduler(policy="fail")
+    scheduler.requests = {request.request_id: request}
+    finish_calls: list[tuple[list[str], RequestStatus]] = []
+
+    def fake_finish(self, request_ids, finished_status):
+        ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
+        finish_calls.append((ids, finished_status))
+        request.status = finished_status
+        return [request]
+
+    monkeypatch.setattr(ar_sched_mod.VLLMScheduler, "finish_requests", fake_finish)
+
+    OmniARScheduler._preempt_request(scheduler, request, timestamp=0.0)
+
+    assert finish_calls == [(["req-confirmed"], RequestStatus.FINISHED_ERROR)]
+    assert request.stop_reason == RECOMPUTE_PREEMPTION_FAIL_MESSAGE
+
+
 def test_fail_discards_in_flight_async_output(monkeypatch: pytest.MonkeyPatch) -> None:
     request = _Request("req-async")
     request.num_in_flight_tokens = 2

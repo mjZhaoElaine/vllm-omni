@@ -2376,7 +2376,8 @@ async def test_visible_non_tail_stage_error_finish_aborts_downstream_stages() ->
 
 
 @pytest.mark.asyncio
-async def test_final_stage_error_finish_still_routes_as_output() -> None:
+async def test_final_stage_error_finish_routes_as_error() -> None:
+    """Tail fail-contract must be ErrorMessage, not a truncated OutputMessage."""
     stage0 = FakeStageClient(stage_type="llm", final_output=True)
     stage_pools = _build_stage_pools(
         [[stage0]],
@@ -2396,17 +2397,6 @@ async def test_final_stage_error_finish_still_routes_as_output() -> None:
         final_stage_id=0,
         final_output_stage_ids={0},
     )
-    handled_errors: list[Any] = []
-    routed: list[Any] = []
-
-    async def record_error(_stage_id, _output) -> None:
-        handled_errors.append(_output)
-
-    async def record_route(*_args) -> None:
-        routed.append(_args)
-
-    orchestrator._handle_stage_error = record_error
-    orchestrator._route_output = record_route
 
     output = _build_request_output(
         req_id,
@@ -2416,8 +2406,63 @@ async def test_final_stage_error_finish_still_routes_as_output() -> None:
 
     await orchestrator._handle_processed_outputs(0, 0, [output])
 
-    assert handled_errors == []
-    assert len(routed) == 1
+    error = orchestrator.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.request_id == req_id
+    assert error.error == RECOMPUTE_PREEMPTION_FAIL_MESSAGE
+    assert stage0.abort_calls == [[req_id]]
+    assert req_id not in orchestrator.request_states
+    assert orchestrator.output_async_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_companion_fail_contract_error_aborts_parent() -> None:
+    """CFG companions have final_stage_id=0; implicit fail must still abort the parent."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=stage_pools,
+    )
+    parent_id = "req-parent"
+    companion_id = "req-parent-uncond"
+    orchestrator.request_states[parent_id] = OrchestratorRequestState(
+        request_id=parent_id,
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+        final_output_stage_ids={0},
+    )
+    orchestrator.request_states[companion_id] = OrchestratorRequestState(
+        request_id=companion_id,
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+        final_output_stage_ids={0},
+    )
+    orchestrator._cfg_tracker.register_companion(parent_id, "uncond", companion_id)
+
+    output = _build_request_output(
+        companion_id,
+        finish_reason="error",
+        stop_reason=RECOMPUTE_PREEMPTION_FAIL_MESSAGE,
+    )
+
+    await orchestrator._handle_processed_outputs(0, 0, [output])
+
+    error = orchestrator.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.request_id == parent_id
+    assert error.error == RECOMPUTE_PREEMPTION_FAIL_MESSAGE
+    aborted_ids = {rid for call in stage0.abort_calls for rid in call}
+    assert aborted_ids == {parent_id, companion_id}
+    assert parent_id not in orchestrator.request_states
+    assert companion_id not in orchestrator.request_states
+    assert orchestrator.output_async_queue.empty()
 
 
 def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:

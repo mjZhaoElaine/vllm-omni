@@ -113,8 +113,9 @@ def _processed_output_error_text(output: Any) -> str | None:
 
     ``OmniRequestOutput.error`` is the explicit path. A finished
     ``finish_reason=error`` completion is the scheduler fail-contract path:
-    it never sets ``.error``. Downstream stages must still go through
-    ``_handle_stage_error`` so prewarmed async-chunk consumers are aborted.
+    it never sets ``.error``. Both must go through ``_handle_stage_error``
+    so the client receives ``ErrorMessage`` and any downstream or companion
+    requests are aborted.
     """
     error = getattr(output, "error", None)
     if error:
@@ -1500,12 +1501,8 @@ class Orchestrator:
                 continue
 
             error_text = _processed_output_error_text(output)
-            explicit_error = getattr(output, "error", None) is not None
-            # ``final_output`` is client-visibility, not pipeline tail. Abort
-            # whenever a later stage exists; the last stage still routes as
-            # OutputMessage.
-            has_downstream = stage_id < req_state.final_stage_id
-            if error_text is not None and (explicit_error or has_downstream):
+            if error_text is not None:
+                explicit_error = getattr(output, "error", None) is not None
                 if not explicit_error:
                     output = OmniRequestOutput.from_error(output.request_id, error_text)
                 await self._handle_stage_error(stage_id, output)

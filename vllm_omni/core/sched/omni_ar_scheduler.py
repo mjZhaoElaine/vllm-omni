@@ -126,6 +126,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _request_has_decode_progress(self, request: Request) -> bool:
         if len(request.output_token_ids) > 0:
             return True
+        # First-decode placeholder: last prefill is in flight, confirmed is
+        # prompt_len - 1. Prefill chunks carry no placeholders.
+        if request.num_output_placeholders > 0:
+            return True
         confirmed = request.num_computed_tokens - request.num_output_placeholders
         return confirmed > request.num_prompt_tokens
 

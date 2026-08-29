@@ -687,6 +687,8 @@ def test_stage_pipeline_config_defaults_recompute_preemption_to_allow() -> None:
         ("dots_tts", (0,)),
         ("moss_tts_nano", (0,)),
         ("qwen3_tts", (0,)),
+        ("aura_omni", (2,)),
+        ("minimax_music3", (0,)),
         ("fish_qwen3_omni", (0,)),
         ("personaplex", (0,)),
         ("moss_tts_delay", (0,)),
