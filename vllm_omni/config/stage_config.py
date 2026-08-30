@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from transformers import PretrainedConfig
 from vllm.logger import init_logger
@@ -27,6 +27,15 @@ logger = init_logger(__name__)
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
+
+# Materialized from StagePipelineConfig. Deploy ``engine_extras``,
+# ``--stage-overrides``, and ``stage_*`` CLI runtime overrides cannot change them.
+_TOPOLOGY_OWNED_ENGINE_KEYS = frozenset(
+    {
+        "recompute_preemption",
+        "requires_full_payload_input",
+    }
+)
 
 
 def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
@@ -87,6 +96,43 @@ def build_stage_runtime_overrides(
         result[key] = value
 
     return result
+
+
+def normalize_pipeline_cli_overrides(
+    pipeline: PipelineConfig,
+    cli_overrides: dict[str, Any],
+) -> dict[str, Any]:
+    """Translate pipeline-owned global CLI aliases into stage-scoped overrides."""
+    normalized = dict(cli_overrides)
+    for source, (stage_id, target) in pipeline.stage_cli_aliases.items():
+        invalid_stage_keys = [
+            key
+            for key, value in normalized.items()
+            if value is not None
+            and (match := _STAGE_OVERRIDE_PATTERN.match(key)) is not None
+            and match.group(2) == source
+            and int(match.group(1)) != stage_id
+        ]
+        if invalid_stage_keys:
+            invalid = ", ".join(sorted(invalid_stage_keys))
+            raise ValueError(
+                f"{invalid} cannot be set for pipeline {pipeline.model_type!r}; "
+                f"{source} belongs to stage {stage_id} as {target}."
+            )
+        value = normalized.pop(source, None)
+        if value is None:
+            continue
+        stage_key = f"stage_{stage_id}_{target}"
+        stage_value = normalized.get(stage_key)
+        if stage_value is not None and stage_value != value:
+            warnings.warn(
+                f"Ignoring {source}={value!r} because {stage_key}={stage_value!r} takes precedence.",
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+        normalized[stage_key] = value
+    return normalized
 
 
 def _apply_diffusion_parallel_runtime_overrides(
@@ -185,12 +231,18 @@ class StagePipelineConfig:
     # The model keeps per-request execution state while awaiting the next
     # async chunk, so the parked request continues to consume model capacity.
     retains_state_across_chunks: bool = False
+    # Whether KV-pressure recompute preemption may requeue the request.
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
     # Alternates picked by ``merge_pipeline_deploy`` based on ``deploy.async_chunk``.
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
+    # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
+    # The callable receives ``(prompt, sampling_params_list)``; downstream
+    # stages continue to receive the original prompt.
+    prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
     omni_kv_config: dict[str, Any] | None = None
@@ -201,6 +253,13 @@ class StagePipelineConfig:
     # by ``stage_init_utils._resolve_model_tokenizer_paths``.
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
+    # Model-owned hook that resolves a pipeline root to this stage's checkpoint.
+    # Consumed and removed before backend engine args are constructed.
+    model_path_resolver: str | None = None
+    # Keep a single-replica diffusion stage in the orchestrator process.
+    # Disabled by default so existing multi-stage pipelines retain subprocess
+    # isolation unless their topology explicitly opts in.
+    inline_diffusion: bool = False
     # Whether the non-async path waits for a complete upstream payload from
     # the model-runner connector before scheduling this stage.
     requires_full_payload_input: bool = False
@@ -251,6 +310,8 @@ class PipelineConfig:
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
     default_deploy_config_name: str | None = None
+    # Global CLI spelling -> (stage id, stage-local spelling).
+    stage_cli_aliases: dict[str, tuple[int, str]] = field(default_factory=dict)
 
     def get_stage(self, stage_id: int) -> StagePipelineConfig | None:
         """Look up a stage by its ID."""
@@ -834,6 +895,9 @@ def _build_engine_args(
         engine_args["model_subdir"] = ps.model_subdir
     if ps.tokenizer_subdir:
         engine_args["tokenizer_subdir"] = ps.tokenizer_subdir
+    if ps.model_path_resolver:
+        engine_args["model_path_resolver"] = ps.model_path_resolver
+    engine_args["inline_diffusion"] = ps.inline_diffusion
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
@@ -851,6 +915,7 @@ def _build_engine_args(
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
+    engine_args["session_mode"] = deploy.session_mode
     if deploy.session_mode == "duplex":
         # The engine admission limit is also the authoritative capacity for
         # model-owned streaming state. Propagate it to every stage instead of
@@ -858,6 +923,11 @@ def _build_engine_args(
         engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
+    # Topology-owned capabilities: apply after deploy/engine_extras so runtime
+    # knobs cannot override replay or transport semantics. ``to_omegaconf()``
+    # reapplies the same keys after CLI / --stage-overrides so this is not the
+    # last writer on the legacy startup path.
+    engine_args["recompute_preemption"] = ps.recompute_preemption
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
     return engine_args
 
@@ -880,6 +950,8 @@ def _build_extras(
         extras["output_connectors"] = dict(ds.output_connectors)
     if ds is not None and ds.input_connectors:
         extras["input_connectors"] = dict(ds.input_connectors)
+    if ps.prompt_transform_func:
+        extras["prompt_transform_func"] = ps.prompt_transform_func
     if ps.prompt_expand_func:
         extras["prompt_expand_func"] = ps.prompt_expand_func
     if ps.cfg_kv_collect_func:
@@ -1024,6 +1096,13 @@ class StageConfig:
         for key, value in runtime_overrides.items():
             if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
                 engine_args[key] = value
+
+        # Topology-owned capabilities stay on the StagePipelineConfig values
+        # already materialized into yaml_engine_args. ``--stage-overrides`` and
+        # equivalent stage_* runtime knobs must not disable them.
+        for key in _TOPOLOGY_OWNED_ENGINE_KEYS:
+            if key in self.yaml_engine_args:
+                engine_args[key] = self.yaml_engine_args[key]
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)

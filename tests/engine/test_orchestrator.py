@@ -21,6 +21,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.core.sched.omni_ar_scheduler import RECOMPUTE_PREEMPTION_FAIL_MESSAGE
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AbortResultMessage,
@@ -256,8 +257,32 @@ class FakeOutputProcessor:
         )
 
     def abort_requests(self, request_ids, internal: bool = False):
-        self.abort_calls.append(request_ids)
-        return request_ids
+        aborted_ids, _outputs = self.abort_requests_collecting_outputs(request_ids, internal=internal)
+        return aborted_ids
+
+    def abort_requests_collecting_outputs(self, request_ids, *, internal: bool = False, commit_state: bool = True):
+        """Mirror MultimodalOutputProcessor collecting for AR abort-prefix tests."""
+        del internal, commit_state
+        ids = list(request_ids)
+        self.abort_calls.append(ids)
+        outputs: list[RequestOutput] = []
+        for rid in ids:
+            seeded = next(
+                (ro for ro in self.request_outputs if getattr(ro, "request_id", None) == rid),
+                None,
+            )
+            token_ids = list(seeded.outputs[0].token_ids) if seeded is not None and seeded.outputs else [1, 2]
+            # Intentionally stamp an internal-looking id on the RequestOutput so
+            # StagePool must re-key by the orchestrator id it passed in.
+            outputs.append(
+                _build_request_output(
+                    f"engine-internal-{rid}",
+                    token_ids=token_ids,
+                    finished=True,
+                    finish_reason="abort",
+                )
+            )
+        return ids, outputs
 
     def update_scheduler_stats(self, _scheduler_stats) -> None:
         return None
@@ -320,6 +345,8 @@ def _build_request_output(
     prompt_token_ids: list[int] | None = None,
     finished: bool = True,
     text: str = "test",
+    finish_reason: str | None = None,
+    stop_reason: str | None = None,
 ) -> RequestOutput:
     completion = CompletionOutput(
         index=0,
@@ -327,8 +354,8 @@ def _build_request_output(
         token_ids=list(token_ids or [1, 2]),
         cumulative_logprob=0.0,
         logprobs=None,
-        finish_reason="stop" if finished else None,
-        stop_reason=None,
+        finish_reason=(finish_reason if finish_reason is not None else ("stop" if finished else None)),
+        stop_reason=stop_reason,
     )
     return RequestOutput(
         request_id=request_id,
@@ -983,7 +1010,11 @@ async def test_run_abort(orchestrator_factory) -> None:
 async def test_run_abort_emits_result_when_rpc_id_set(orchestrator_factory) -> None:
     stages = [
         FakeStageClient(stage_type="llm", final_output=False),
-        FakeStageClient(stage_type="llm", final_output=True),
+        FakeStageClient(
+            stage_type="llm",
+            final_output=True,
+            next_inputs=[{"prompt_token_ids": [7, 8, 9]}],
+        ),
     ]
     processors = [
         FakeOutputProcessor(request_outputs=[_build_request_output("req-ack", token_ids=[1], finished=True)]),
@@ -1002,6 +1033,11 @@ async def test_run_abort_emits_result_when_rpc_id_set(orchestrator_factory) -> N
             final_stage_id=1,
         )
         await _wait_for(lambda: len(stages[0].add_request_calls) == 1)
+        # Abort outputs come from the final AR stage's output processor, and
+        # StagePool.abort_requests only collects for requests with a live
+        # replica binding. Forward off stage-0 first so stage-1 is bound.
+        stages[0].push_engine_core_outputs(_engine_core_outputs("stage0-raw", 1.0))
+        await _wait_for(lambda: len(stages[1].add_request_calls) == 1)
 
         orchestrator_fixture.request_sync_q.put_nowait(AbortRequestMessage(request_ids=["req-ack"], rpc_id="abort-1"))
         result = await _get_rpc_message(orchestrator_fixture)
@@ -1011,9 +1047,51 @@ async def test_run_abort_emits_result_when_rpc_id_set(orchestrator_factory) -> N
         assert result.error is None
         assert result.rpc_correlation_key == ("abort", "abort-1")
         assert stages[0].abort_calls == [["req-ack"]]
+        assert stages[1].abort_calls == [["req-ack"]]
         assert "req-ack" not in orchestrator_fixture.orchestrator.request_states
+        assert result.abort_outputs is not None
+        assert len(result.abort_outputs) == 1
+        abort_msg = result.abort_outputs[0]
+        assert abort_msg.request_id == "req-ack"
+        assert abort_msg.finished is True
+        assert abort_msg.stage_id == 1
+        assert list(abort_msg.engine_outputs.outputs[0].token_ids) == [2]
+        assert abort_msg.engine_outputs.outputs[0].finish_reason == "abort"
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_abort_marks_only_last_final_stage_output_finished() -> None:
+    """A request with two final AR stages must keep earlier abort outputs unfinished."""
+    stages = [
+        FakeStageClient(stage_type="llm", final_output=True),
+        FakeStageClient(stage_type="llm", final_output=True),
+    ]
+    processors = [
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-two", token_ids=[1], finished=True)]),
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-two", token_ids=[2], finished=True)]),
+    ]
+    pools = _build_stage_pools([[stages[0]], [stages[1]]], output_processors=processors)
+    pools[0]._request_bindings["req-two"] = 0
+    pools[1]._request_bindings["req-two"] = 0
+
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    orchestrator.request_states["req-two"] = OrchestratorRequestState(
+        request_id="req-two",
+        final_stage_id=1,
+        final_output_stage_ids={0, 1},
+    )
+
+    outputs = await orchestrator._abort_request_ids(["req-two"])
+    assert [(msg.stage_id, msg.finished) for msg in outputs] == [(0, False), (1, True)]
+    assert list(outputs[0].engine_outputs.outputs[0].token_ids) == [1]
+    assert list(outputs[1].engine_outputs.outputs[0].token_ids) == [2]
 
 
 @pytest.mark.asyncio
@@ -2199,6 +2277,195 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
 
     assert pool.calls == [[output]]
     assert routed == [built_metrics]
+
+
+@pytest.mark.asyncio
+async def test_non_final_stage_error_finish_aborts_downstream_stages() -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=stage_pools,
+        async_chunk=True,
+    )
+    req_id = "req-fail"
+    orchestrator.request_states[req_id] = OrchestratorRequestState(
+        request_id=req_id,
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+    )
+    assert stage_pools[0].select_replica_id(req_id) == 0
+    assert stage_pools[1].select_replica_id(req_id) == 0
+
+    output = _build_request_output(
+        req_id,
+        finish_reason="error",
+        stop_reason=RECOMPUTE_PREEMPTION_FAIL_MESSAGE,
+    )
+
+    await orchestrator._handle_processed_outputs(0, 0, [output])
+
+    error = orchestrator.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.request_id == req_id
+    assert error.error == RECOMPUTE_PREEMPTION_FAIL_MESSAGE
+    assert stage0.abort_calls == [[req_id]]
+    assert stage1.abort_calls == [[req_id]]
+    assert req_id not in orchestrator.request_states
+
+
+@pytest.mark.asyncio
+async def test_visible_non_tail_stage_error_finish_aborts_downstream_stages() -> None:
+    """MiMo-shaped topology: stage 0 is client-visible and still has a downstream.
+
+    ``final_output`` means the stage emits user-visible content, not that it is
+    the pipeline tail. A fail-contract finish on stage 0 must abort stage 1.
+    """
+    stage0 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="text")
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=stage_pools,
+        async_chunk=True,
+    )
+    req_id = "req-mimo-fail"
+    orchestrator.request_states[req_id] = OrchestratorRequestState(
+        request_id=req_id,
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+        final_output_stage_ids={0, 1},
+    )
+    assert stage_pools[0].select_replica_id(req_id) == 0
+    assert stage_pools[1].select_replica_id(req_id) == 0
+
+    output = _build_request_output(
+        req_id,
+        finish_reason="error",
+        stop_reason=RECOMPUTE_PREEMPTION_FAIL_MESSAGE,
+    )
+
+    await orchestrator._handle_processed_outputs(0, 0, [output])
+
+    error = orchestrator.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.request_id == req_id
+    assert error.error == RECOMPUTE_PREEMPTION_FAIL_MESSAGE
+    assert stage0.abort_calls == [[req_id]]
+    assert stage1.abort_calls == [[req_id]]
+    assert req_id not in orchestrator.request_states
+
+
+@pytest.mark.asyncio
+async def test_final_stage_error_finish_routes_as_error() -> None:
+    """Tail fail-contract must be ErrorMessage, not a truncated OutputMessage."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=stage_pools,
+    )
+    req_id = "req-final"
+    orchestrator.request_states[req_id] = OrchestratorRequestState(
+        request_id=req_id,
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+        final_output_stage_ids={0},
+    )
+    assert stage_pools[0].select_replica_id(req_id) == 0
+
+    output = _build_request_output(
+        req_id,
+        finish_reason="error",
+        stop_reason=RECOMPUTE_PREEMPTION_FAIL_MESSAGE,
+    )
+
+    await orchestrator._handle_processed_outputs(0, 0, [output])
+
+    error = orchestrator.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.request_id == req_id
+    assert error.error == RECOMPUTE_PREEMPTION_FAIL_MESSAGE
+    assert stage0.abort_calls == [[req_id]]
+    assert req_id not in orchestrator.request_states
+    assert orchestrator.output_async_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_companion_fail_contract_error_aborts_parent() -> None:
+    """CFG companions have final_stage_id=0; implicit fail must still abort the parent."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=stage_pools,
+    )
+    parent_id = "req-parent"
+    companion_id = "req-parent-uncond"
+    orchestrator.request_states[parent_id] = OrchestratorRequestState(
+        request_id=parent_id,
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+        final_output_stage_ids={0},
+    )
+    orchestrator.request_states[companion_id] = OrchestratorRequestState(
+        request_id=companion_id,
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+        final_output_stage_ids={0},
+    )
+    orchestrator._cfg_tracker.register_companion(parent_id, "uncond", companion_id)
+    assert stage_pools[0].select_replica_id(parent_id) == 0
+    assert stage_pools[0].select_replica_id(companion_id) == 0
+
+    output = _build_request_output(
+        companion_id,
+        finish_reason="error",
+        stop_reason=RECOMPUTE_PREEMPTION_FAIL_MESSAGE,
+    )
+
+    await orchestrator._handle_processed_outputs(0, 0, [output])
+
+    error = orchestrator.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.request_id == parent_id
+    assert error.error == RECOMPUTE_PREEMPTION_FAIL_MESSAGE
+    aborted_ids = {rid for call in stage0.abort_calls for rid in call}
+    assert aborted_ids == {parent_id, companion_id}
+    assert parent_id not in orchestrator.request_states
+    assert companion_id not in orchestrator.request_states
+    assert orchestrator.output_async_queue.empty()
 
 
 def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:

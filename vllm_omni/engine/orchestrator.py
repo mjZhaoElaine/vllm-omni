@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -29,7 +30,7 @@ from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
-from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
@@ -66,6 +67,12 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
+
+def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
+    for artifact_dir in artifact_dirs:
+        shutil.rmtree(artifact_dir, ignore_errors=True)
+
+
 # VLLM_OMNI_EVENT_DRIVEN_ORCH=1 switches the orchestration loop (and the
 # serving-side final-output drain in entrypoints/async_omni.py) from the legacy
 # 1 ms poll cadence to event-driven wakeups: one reader task per live LLM stage
@@ -99,6 +106,32 @@ if TYPE_CHECKING:
         DuplexSessionRuntimeState,
     )
     from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+
+
+def _processed_output_error_text(output: Any) -> str | None:
+    """Return a client-visible error string for a processed stage output.
+
+    ``OmniRequestOutput.error`` is the explicit path. A finished
+    ``finish_reason=error`` completion is the scheduler fail-contract path:
+    it never sets ``.error``. Both must go through ``_handle_stage_error``
+    so the client receives ``ErrorMessage`` and any downstream or companion
+    requests are aborted.
+    """
+    error = getattr(output, "error", None)
+    if error:
+        return str(error)
+    if not getattr(output, "finished", False):
+        return None
+    completions = getattr(output, "outputs", None) or ()
+    if not completions:
+        return None
+    finish_reason = getattr(completions[0], "finish_reason", None)
+    if finish_reason not in (FinishReason.ERROR, "error"):
+        return None
+    stop_reason = getattr(completions[0], "stop_reason", None)
+    if stop_reason is None:
+        return "stage request failed"
+    return str(stop_reason)
 
 
 def _build_terminal_empty_output(
@@ -220,6 +253,7 @@ class OrchestratorRequestState:
     duplex_stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     duplex_config_generation: int = -1
     running_counter_registered: bool = False
+    request_artifact_dirs: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -379,6 +413,7 @@ class Orchestrator:
     # Class-level defaults so tests that bypass __init__ via object.__new__
     # don't AttributeError when transfer / counter emit paths access them.
     _running_counter: OmniRequestCounter | None = None
+    _engines_waiting_counter: OmniRequestCounter | None = None
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
@@ -395,6 +430,7 @@ class Orchestrator:
         pd_config: dict[str, Any] | None = None,
         membership_controller: MembershipController | None = None,
         running_counter: OmniRequestCounter | None = None,
+        engines_waiting_counter: OmniRequestCounter | None = None,
         transfer_emitter: Any = None,
         prom_metrics: Any = None,
         log_stats: bool = False,
@@ -431,7 +467,13 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
-        self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
+        self._init_metrics_state(
+            stage_pools,
+            running_counter,
+            transfer_emitter,
+            engines_waiting_counter=engines_waiting_counter,
+            log_stats=log_stats,
+        )
 
         self._cfg_tracker = CfgCompanionTracker()
         self._stage_input_processors: dict[int, Any] = {}
@@ -477,6 +519,7 @@ class Orchestrator:
         stage_pools: list[StagePool],
         running_counter: OmniRequestCounter | None,
         transfer_emitter: Any,
+        engines_waiting_counter: OmniRequestCounter | None = None,
         log_stats: bool = False,
     ) -> None:
         """Wire up all metric-related orchestrator state.
@@ -502,6 +545,7 @@ class Orchestrator:
         from iteration_stats independently of scheduler gauges.
         """
         self._running_counter = running_counter
+        self._engines_waiting_counter = engines_waiting_counter
         self._transfer_emitter = transfer_emitter
 
         # Flat engine_idx ↔ (stage, replica) maps. The reverse map is
@@ -723,6 +767,7 @@ class Orchestrator:
             final_output_stage_ids=final_output_stage_ids,
             request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
+            request_artifact_dirs=set(msg.request_artifact_dirs or ()),
         )
         self.request_states[request_id] = req_state
         self._register_running_request(req_state)
@@ -852,14 +897,19 @@ class Orchestrator:
         When ``msg.rpc_id`` is set, emit :class:`AbortResultMessage` after
         stage aborts, binding release, and request cleanup complete so the
         caller can await acknowledgment. Fire-and-forget aborts omit rpc_id.
+
+        AR final-stage abort outputs (partial tokens) are attached to the
+        result message when ``rpc_id`` is set, or enqueued on
+        ``output_async_queue`` for fire-and-forget aborts.
         """
         request_ids = msg.request_ids
         error: str | None = None
+        abort_outputs: list[OutputMessage] = []
         try:
             # _cleanup_request_ids is CFG-aware: it expands aborted parents to
             # their companions and fails a deferred parent whose companion is
             # aborted before its output arrived.
-            await self._cleanup_request_ids(list(request_ids), abort=True)
+            abort_outputs = await self._cleanup_request_ids(list(request_ids), abort=True)
             logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
         except Exception as exc:
             error = str(exc)
@@ -874,8 +924,12 @@ class Orchestrator:
                     rpc_id=msg.rpc_id,
                     success=error is None,
                     error=error,
+                    abort_outputs=abort_outputs or None,
                 )
             )
+        elif abort_outputs:
+            for output_msg in abort_outputs:
+                await self.output_async_queue.put(output_msg)
 
     async def _handle_interaction(self, msg: InteractionMessage) -> None:
         """Handle a midway interaction for an active streaming diffusion request."""
@@ -915,13 +969,53 @@ class Orchestrator:
                 )
             )
 
-    async def _abort_request_ids(self, request_ids: list[str]) -> None:
-        """Forward abort requests to all stage pools."""
+    async def _abort_request_ids(self, request_ids: list[str]) -> list[OutputMessage]:
+        """Forward abort requests to all stage pools.
+
+        Collects final-stage AR abort outputs (partial tokens) while request
+        state is still available for stage-id filtering. Diffusion pools do
+        not contribute abort outputs.
+        """
         if not request_ids:
-            return
+            return []
+        abort_outputs: list[OutputMessage] = []
         for pool in self.stage_pools:
-            await pool.abort_requests(request_ids)
+            stage_outputs = await pool.abort_requests(request_ids) or []
+            if bool(getattr(pool, "final_output", False)) and getattr(pool, "stage_type", None) != "diffusion":
+                final_output_type = getattr(pool.stage_client, "final_output_type", None) or "text"
+                for orch_req_id, request_output in stage_outputs:
+                    req_state = self.request_states.get(orch_req_id)
+                    if req_state is None:
+                        continue
+                    final_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+                    if pool.stage_id not in final_stage_ids:
+                        continue
+                    engine_output = OmniRequestOutput.from_stage_output(
+                        request_output,
+                        request_id=orch_req_id,
+                        finished=True,
+                        stage_id=pool.stage_id,
+                        replica_id=pool.get_bound_replica_id(orch_req_id),
+                        final_output_type=final_output_type,
+                    )
+                    abort_outputs.append(
+                        OutputMessage(
+                            request_id=orch_req_id,
+                            stage_id=pool.stage_id,
+                            replica_id=pool.get_bound_replica_id(orch_req_id),
+                            engine_outputs=engine_output,
+                            metrics=None,
+                            finished=False,
+                            stage_submit_ts=req_state.stage_submit_ts.get(pool.stage_id),
+                        )
+                    )
             pool.release_bindings(request_ids)
+        last_index_by_req: dict[str, int] = {}
+        for index, output_msg in enumerate(abort_outputs):
+            last_index_by_req[output_msg.request_id] = index
+        for index, output_msg in enumerate(abort_outputs):
+            output_msg.finished = index == last_index_by_req[output_msg.request_id]
+        return abort_outputs
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
@@ -1406,7 +1500,11 @@ class Orchestrator:
                 )
                 continue
 
-            if getattr(output, "error", None) is not None:
+            error_text = _processed_output_error_text(output)
+            if error_text is not None:
+                explicit_error = getattr(output, "error", None) is not None
+                if not explicit_error:
+                    output = OmniRequestOutput.from_error(output.request_id, error_text)
                 await self._handle_stage_error(stage_id, output)
                 continue
 
@@ -1449,11 +1547,20 @@ class Orchestrator:
         """Update one replica snapshot and expose the stage-wide total."""
         self._stage_replica_waiting[(stage_id, replica_id)] = max(int(n_waiting), 0)
         self._set_stage_waiting_total(stage_id)
+        self._sync_engines_waiting_counter()
 
     def _remove_stage_replica_waiting(self, stage_id: int, replica_id: int) -> None:
         """Drop a dead replica's snapshot and refresh the stage total."""
         self._stage_replica_waiting.pop((stage_id, replica_id), None)
         self._set_stage_waiting_total(stage_id)
+        self._sync_engines_waiting_counter()
+
+    def _sync_engines_waiting_counter(self) -> None:
+        """Aggregate per-replica waiting into the counter shared with the
+        frontend so engine-queued requests show as waiting, not running."""
+        counter = self._engines_waiting_counter
+        if counter is not None:
+            counter.value = sum(self._stage_replica_waiting.values())
 
     def _set_stage_waiting_total(self, stage_id: int) -> None:
         if self._prom_metrics is None:
@@ -1660,7 +1767,7 @@ class Orchestrator:
         *,
         abort: bool = False,
         close_duplex_sessions: bool = False,
-    ) -> None:
+    ) -> list[OutputMessage]:
         """Release pool bindings and logical request state for the given ids.
 
         CFG-aware: cleaning a parent releases its tracker state and pulls its
@@ -1669,9 +1776,13 @@ class Orchestrator:
         can never complete). Every teardown path (stage error, abort, replica
         loss, membership unregister) funnels through here, so tracker state
         cannot outlive its requests.
+
+        Returns:
+            Final-stage AR abort ``OutputMessage`` list when ``abort=True``;
+            otherwise an empty list.
         """
         if not request_ids:
-            return
+            return []
 
         cleanup_ids = list(dict.fromkeys(request_ids))
         batch = set(cleanup_ids)
@@ -1713,13 +1824,16 @@ class Orchestrator:
                 cleanup_ids.extend(stale_request_ids)
             cleanup_ids = list(dict.fromkeys(cleanup_ids))
 
+        abort_outputs: list[OutputMessage] = []
         try:
             if abort:
-                await self._abort_request_ids(cleanup_ids)
+                abort_outputs = await self._abort_request_ids(cleanup_ids)
             self._release_request_bindings(cleanup_ids)
             for request_id in cleanup_ids:
                 self._pd_kv_params.pop(request_id, None)
                 req_state = self.request_states.pop(request_id, None)
+                if req_state is not None:
+                    cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", ()))
                 if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                     self._running_counter.decrement()
                     req_state.running_counter_registered = False
@@ -1729,6 +1843,7 @@ class Orchestrator:
             raise
         if closing_session_ids and self.duplex_control_plane is not None:
             self.duplex_control_plane.finalize_closed_sessions(closing_session_ids)
+        return abort_outputs
 
     async def _apply_raw_terminal_stage_finish(
         self,
@@ -2627,13 +2742,28 @@ class Orchestrator:
                 req_state.prompt,
                 streaming_context=req_state.streaming,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
                 req_id,
                 next_logical,
             )
-            raise
+            if not self._is_duplex_session_request(req_state):
+                raise
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=req_id,
+                    stage_id=next_logical,
+                    error=f"Stage-{next_logical} input processor failed: {type(exc).__name__}: {exc}",
+                    error_type=type(exc).__name__,
+                )
+            )
+            await self._cleanup_request_ids(
+                [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                abort=True,
+                close_duplex_sessions=True,
+            )
+            return
         finally:
             req_state.streaming.source_token_decoder = previous_decoder
 

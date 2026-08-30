@@ -7,7 +7,7 @@ import os
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
@@ -163,6 +163,7 @@ class OmniEngineArgs(EngineArgs):
             If None, default processing is used.
         stage_connector_spec: Extra configuration for stage connector
         async_chunk: If set to True, perform async chunk
+        session_mode: Request lifecycle mode, either turn-based or duplex
         worker_type: Model Type, e.g., "ar" or "generation"
         task_type: Model-defined startup task type. Consumers validate the
             supported values and decide whether it selects request behavior,
@@ -192,7 +193,9 @@ class OmniEngineArgs(EngineArgs):
     subtalker_sampling_params: dict[str, Any] | None = None
     silence_ban_frames: int = 0
     async_chunk: bool = False
+    session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
@@ -415,7 +418,9 @@ class OmniEngineArgs(EngineArgs):
             # All kwargs below are Omni specific
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
+            session_mode=self.session_mode,
             retains_state_across_chunks=self.retains_state_across_chunks,
+            recompute_preemption=self.recompute_preemption,
             active_stream_window=self.active_stream_window,
             duplex_max_sessions=self.duplex_max_sessions,
             model_stage=self.model_stage,
@@ -580,7 +585,6 @@ class OrchestratorArgs:
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
     vae_parallel_mode: str = "tile"
-    text_encoder_tp_size: int = 1
     default_sampling_params: str | None = None
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None

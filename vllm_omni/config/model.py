@@ -1,5 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import MISSING, field
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ConfigDict, TypeAdapter
 from vllm.config import ModelConfig
@@ -93,6 +96,7 @@ class OmniModelConfig(ModelConfig):
          hf_text_config: The sub text_config of the model's hf_config (default: None)
          stage_id: Identifier for the stage in a multi-stage pipeline (default: 0)
          async_chunk: If set to True, perform async chunk
+         session_mode: Request lifecycle mode, either turn-based or duplex
          model_stage: Stage type identifier, e.g., "thinker" or "talker"
              (default: "thinker")
          model_arch: Model architecture name
@@ -121,7 +125,9 @@ class OmniModelConfig(ModelConfig):
 
     stage_id: int = 0
     async_chunk: bool = False
+    session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
     duplex_max_sessions: int = 1
