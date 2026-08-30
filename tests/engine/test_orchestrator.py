@@ -2446,6 +2446,8 @@ async def test_companion_fail_contract_error_aborts_parent() -> None:
         final_output_stage_ids={0},
     )
     orchestrator._cfg_tracker.register_companion(parent_id, "uncond", companion_id)
+    assert stage_pools[0].select_replica_id(parent_id) == 0
+    assert stage_pools[0].select_replica_id(companion_id) == 0
 
     output = _build_request_output(
         companion_id,
