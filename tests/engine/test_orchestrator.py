@@ -2397,6 +2397,7 @@ async def test_final_stage_error_finish_routes_as_error() -> None:
         final_stage_id=0,
         final_output_stage_ids={0},
     )
+    assert stage_pools[0].select_replica_id(req_id) == 0
 
     output = _build_request_output(
         req_id,
