@@ -13,6 +13,7 @@ from vllm.inputs import tokens_input
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
+    OutputPolicy,
     PreparedRequest,
     apply_max_new_tokens,
     conditioning_cache_salt,
@@ -112,7 +113,12 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             prompt = tokens_input(prompt_token_ids=[1])
         prompt["additional_information"] = tts_params
         prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
-        return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type=self.name)
+        return PreparedRequest(
+            prompt=prompt,
+            tts_params=tts_params,
+            model_type=self.name,
+            output_policy=OutputPolicy(accumulate_nonstreaming=self.name == "moss_tts_nano"),
+        )
 
     def apply_sampling_overrides(
         self,
