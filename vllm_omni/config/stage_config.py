@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from transformers import PretrainedConfig
 from vllm.logger import init_logger
@@ -27,6 +27,15 @@ logger = init_logger(__name__)
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
+
+# Materialized from StagePipelineConfig. Deploy ``engine_extras``,
+# ``--stage-overrides``, and ``stage_*`` CLI runtime overrides cannot change them.
+_TOPOLOGY_OWNED_ENGINE_KEYS = frozenset(
+    {
+        "recompute_preemption",
+        "requires_full_payload_input",
+    }
+)
 
 
 def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
@@ -244,6 +253,8 @@ class StagePipelineConfig:
     # The model keeps per-request execution state while awaiting the next
     # async chunk, so the parked request continues to consume model capacity.
     retains_state_across_chunks: bool = False
+    # Whether KV-pressure recompute preemption may requeue the request.
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
@@ -458,6 +469,7 @@ class StageDeployConfig:
     fa_deterministic: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
+    video_output_transport: dict[str, Any] | None = None
     enable_cache_dit_summary: bool | None = None
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
@@ -471,7 +483,11 @@ class StageDeployConfig:
 
     # Runtime optimizations used by diffusion loading/execution.
     enable_multithread_weight_load: bool | None = None
+    enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
+    diffusion_offload_config: dict[str, Any] | None = None
+    # Compatibility aliases for existing callers and model-specific stage
+    # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
 
@@ -506,6 +522,12 @@ class DuplexSessionRuntimeConfig:
     max_pending_turns_per_session: int = 4
     max_sessions: int = 1
     completed_append_cache_size: int = 256
+    server_vad_model_path: str | None = None
+    # Startup warmup: run this many silent 80 ms-style frames through a
+    # throwaway realtime session before real clients are admitted, so
+    # one-time costs (kernel JIT, first prefill/decode paths, codec caches)
+    # never land on the first user. 0 disables the warmup.
+    warmup_frames: int = 0
 
     def __post_init__(self) -> None:
         positive = {
@@ -520,6 +542,10 @@ class DuplexSessionRuntimeConfig:
         }
         if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
             raise ValueError("duplex_session.idle_ttl_s must be positive or null")
+        if self.server_vad_model_path is not None and (
+            not isinstance(self.server_vad_model_path, str) or not self.server_vad_model_path.strip()
+        ):
+            raise ValueError("duplex_session.server_vad_model_path must be a non-empty string or null")
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"duplex_session.{name} must be positive")
@@ -951,6 +977,11 @@ def _build_engine_args(
         engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
+    # Topology-owned capabilities: apply after deploy/engine_extras so runtime
+    # knobs cannot override replay or transport semantics. ``to_omegaconf()``
+    # reapplies the same keys after CLI / --stage-overrides so this is not the
+    # last writer on the legacy startup path.
+    engine_args["recompute_preemption"] = ps.recompute_preemption
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
     return engine_args
 
@@ -1116,10 +1147,29 @@ class StageConfig:
             _apply_diffusion_parallel_runtime_overrides(engine_args, runtime_overrides)
             reconcile_diffusion_attention_overrides(engine_args, runtime_overrides)
 
-        # CLI overrides take precedence over YAML defaults
+        # CLI overrides take precedence over YAML defaults. Most dict-valued
+        # overrides are deep-merged so a partial CLI dict (e.g. --no-guardrails
+        # riding on ``model_config``) layers onto the deploy YAML instead of
+        # clobbering sibling keys such as ``policy_server_config`` — the same
+        # rationale as the platform-overlay deep-merge. Legacy atomic mappings
+        # are handled explicitly below.
         for key, value in runtime_overrides.items():
             if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
-                engine_args[key] = value
+                existing = engine_args.get(key)
+                # ``omni_kv_config`` is an atomic legacy override: callers use
+                # a partial mapping to replace the topology-provided transfer
+                # role, rather than to add fields to it.
+                if key != "omni_kv_config" and isinstance(existing, dict) and isinstance(value, dict):
+                    engine_args[key] = _get_recursively_merged_dict(existing, value)
+                else:
+                    engine_args[key] = value
+
+        # Topology-owned capabilities stay on the StagePipelineConfig values
+        # already materialized into yaml_engine_args. ``--stage-overrides`` and
+        # equivalent stage_* runtime knobs must not disable them.
+        for key in _TOPOLOGY_OWNED_ENGINE_KEYS:
+            if key in self.yaml_engine_args:
+                engine_args[key] = self.yaml_engine_args[key]
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)

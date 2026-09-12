@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """NemotronVoiceChat pipeline: thinker (speech -> frame-locked text) -> talker
 (text timeline -> 31-quantizer RVQ code stacks) -> code2wav (codes -> 22.05 kHz PCM).
 
@@ -32,10 +32,10 @@ NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
     model_type="nemotron_voicechat",
     model_arch="NemotronVoiceChatThinkerForConditionalGeneration",
     duplex_runtime_extension=(
-        "vllm_omni.experimental.fullduplex.nemotron_voicechat.runtime.NemotronVoiceChatDuplexRuntimeExtension"
+        "vllm_omni.model_executor.models.nemotron_voicechat.duplex.runtime.NemotronVoiceChatDuplexRuntimeExtension"
     ),
     duplex_serving_adapter=(
-        "vllm_omni.experimental.fullduplex.nemotron_voicechat.serving_adapter.NemotronVoiceChatServingRuntimeAdapter"
+        "vllm_omni.model_executor.models.nemotron_voicechat.duplex.serving_adapter.NemotronVoiceChatServingRuntimeAdapter"
     ),
     duplex_control_enabled=True,
     # Named after the alias key so the deploy-yaml stem substring-matches the
@@ -74,6 +74,7 @@ NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
             async_chunk_process_next_stage_input_func=f"{_PROC}.talker2code2wav_async_chunk",
             sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
             sampling_constraints={"detokenize": False},
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=2,

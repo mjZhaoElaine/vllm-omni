@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Gepard-1.0 native-AR talker.
 
 Single-stage AR TTS on a vLLM-native Qwen3.5 backbone. Each step samples one
@@ -22,7 +22,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM
-from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.gepard.configuration_gepard import GepardConfig
@@ -199,8 +199,10 @@ class GepardTalkerForConditionalGeneration(nn.Module):
 
         # NanoCodec loads lazily on first decode, so load_format=dummy and
         # NeMo-less environments never pay for it.
-        loader = AutoWeightsLoader(self, skip_prefixes=["mtp.", "ref_compressor."])
-        return loader.load_weights(iter(rest))
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(
+            iter(rest), mapper=WeightsMapper(orig_to_new_prefix={"mtp.": None, "ref_compressor.": None})
+        )
 
     def _get_or_create_state(self, request_id: str) -> _GepardState:
         st = self._active_states.get(request_id)
@@ -361,20 +363,6 @@ class GepardTalkerForConditionalGeneration(nn.Module):
                         req_id,
                         undelivered,
                     )
-            elif state.frame_count:
-                # Not a resubmit, so this is a preemption recompute, and it
-                # cannot be recovered: a frame's 31 side-channel codes are not
-                # in the token stream, so the replayed prompt cannot rebuild the
-                # KV that produced the audio already delivered. Generation
-                # restarts from frame 0 and the caller gets two unrelated halves.
-                logger.warning(
-                    "Gepard request %s was preempted after %d frame(s) and is being recomputed; "
-                    "its audio will not continue from where it stopped. Raise the stage's "
-                    "gpu_memory_utilization or lower max_num_seqs to keep requests from being "
-                    "preempted.",
-                    req_id,
-                    state.frame_count,
-                )
             state.curr_embed_for_next = None
             state.frames.clear()
             state.emitted_frames = 0

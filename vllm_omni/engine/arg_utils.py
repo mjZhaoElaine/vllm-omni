@@ -7,7 +7,7 @@ import os
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
@@ -195,6 +195,7 @@ class OmniEngineArgs(EngineArgs):
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
@@ -381,9 +382,9 @@ class OmniEngineArgs(EngineArgs):
                 if tokenizer_subfolder:
                     # Download just the tokenizer files from the subfolder
                     try:
-                        from huggingface_hub import snapshot_download
+                        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-                        local_dir = snapshot_download(
+                        local_dir = hf_api().snapshot_download(
                             model_path,
                             allow_patterns=[
                                 f"{tokenizer_subfolder}/tokenizer*",
@@ -419,6 +420,7 @@ class OmniEngineArgs(EngineArgs):
             async_chunk=self.async_chunk,
             session_mode=self.session_mode,
             retains_state_across_chunks=self.retains_state_across_chunks,
+            recompute_preemption=self.recompute_preemption,
             active_stream_window=self.active_stream_window,
             duplex_max_sessions=self.duplex_max_sessions,
             model_stage=self.model_stage,
@@ -443,8 +445,8 @@ class OmniEngineArgs(EngineArgs):
 @dataclass
 class OmniAsyncEngineArgs(AsyncEngineArgs, OmniEngineArgs):
     @classmethod
-    def add_cli_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-        parser = AsyncEngineArgs.add_cli_args(parser)
+    def add_cli_args(cls, parser: argparse.ArgumentParser, async_args_only: bool = False) -> argparse.ArgumentParser:
+        parser = AsyncEngineArgs.add_cli_args(parser, async_args_only=async_args_only)
         parser = OmniEngineArgs._add_omni_specific_args(parser)
         return parser
 
@@ -504,6 +506,10 @@ class OrchestratorArgs:
     # === Lifecycle ===
     stage_init_timeout: int = 300
     init_timeout: int = 600
+    # Initialize stages sharing a physical GPU concurrently, guarded by
+    # pre-launch admission + engine-core SH/EX device locks. Off by default;
+    # enable only when the GPU is dedicated to this deployment.
+    parallel_stage_init: bool = False
 
     # === Cross-stage Communication ===
     batch_timeout: int = 10
@@ -514,7 +520,7 @@ class OrchestratorArgs:
 
     # === Config Files ===
     deploy_config: str | None = None
-    stage_overrides: str | None = None  # raw JSON string; parsed downstream
+    stage_overrides: dict[str, dict[str, Any]] | None = None
     # Optional composable-parallel strategy.yaml; orchestrator reads it, overlays
     # derived sizing onto merged stages, then drops it before per-stage engine args.
     strategy_config: str | None = None
@@ -562,12 +568,17 @@ class OrchestratorArgs:
     diffusion_compile_dynamic: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
+    video_output_transport: dict[str, object] | None = None
     enable_cache_dit_summary: bool = False
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     enable_multithread_weight_load: bool = True
+    enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
+    diffusion_offload_config: dict[str, Any] | None = None
+    # Compatibility aliases for existing callers and model-specific stage
+    # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False

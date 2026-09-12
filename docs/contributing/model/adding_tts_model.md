@@ -89,6 +89,28 @@ CUDA graph state), key it by `info.get("_omni_req_id")` and free the entry on
 request finish. A shared buffer silently corrupts audio across concurrent requests —
 the symptom is crosstalk or truncation under load, nothing in single-request tests.
 
+**I6. Recompute preemption safety.** vLLM may recompute-preempt a running AR request
+when KV cache is under pressure, replaying the prompt to rebuild blocks. That is only
+safe when **all per-step decode state that produced already-delivered output also lives
+in the token/KV stream**. Declare `recompute_preemption="fail"` on the AR codec stage in
+`pipeline.py` when any of the following hold:
+
+| Signal | Example |
+|--------|---------|
+| Multi-codebook / multi-head sampling where only one code enters the token stream | Gepard (1/32 FSQ heads), Qwen3-TTS (`code_predictor` + `talker_mtp`) |
+| Next-step input built from side-channel tensors (`curr_embed_for_next`, composed embeddings, delay-pattern feedback) | VoxCPM2, dots.tts, MOSS-TTS |
+| Per-request generator or codec state outside KV (`inference_stream()`, audio queues, precomputed stop logits) | MOSS-TTS-Nano, Higgs-Audio |
+| Diffusion / CFM / local depth decoders fed from hidden states rather than sampled tokens | Voxtral TTS, Ming TTS |
+
+Use the default `allow` only when a single sampled token per step fully determines the
+next KV input **and** no hidden side state is required to continue generation. When in
+doubt, prefer `fail`: the scheduler terminates with one explicit error instead of
+delivering spliced audio. Deploy YAML, `--stage-overrides`, and per-stage CLI runtime
+overrides cannot change this field.
+
+See [vllm-project/vllm-omni#6179](https://github.com/vllm-project/vllm-omni/issues/6179)
+for the failure mode this prevents.
+
 ## Overview
 
 vLLM-Omni supports TTS models as multi-stage pipelines where each stage runs independently
@@ -448,6 +470,7 @@ Key topology fields belong to `StagePipelineConfig`:
 | `async_chunk_process_next_stage_input_func` | Processor for streaming chunk handoff. |
 | `final_output` / `final_output_type` | Whether this stage produces user-facing output and its modality. |
 | `owns_tokenizer` | Whether this stage supplies the pipeline tokenizer. |
+| `recompute_preemption` | `allow` (default) or `fail`; see invariant **I6**. |
 
 For example, a two-stage TTS topology can be defined as:
 
@@ -991,10 +1014,13 @@ git push origin your-branch --force-with-lease
 
 ## Adding a Model Recipe
 
-After implementing and testing your model, add a model recipe to the
-[vllm-project/recipes](https://github.com/vllm-project/recipes) repository so users can
-get started quickly. See [Adding an Omni-Modality Model](./adding_omni_model.md#adding-a-model-recipe)
-for the expected format.
+After implementing and testing your model, add a recipe under this repository's
+`recipes/` directory. Follow the
+[`add-recipe` skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/add-recipe/SKILL.md)
+and [`recipes/TEMPLATE.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/TEMPLATE.md),
+update the model row in
+[`recipes/README.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/README.md),
+and synchronize the relevant TTS example and speech API documentation.
 
 ## Summary
 
@@ -1011,7 +1037,7 @@ Adding a TTS model to vLLM-Omni involves:
 8. **Online serving** - add all 5 integration points to `serving_speech.py` in one commit
 9. **Tests** - cover single request, batching, and streaming
 10. **Pre-commit + DCO** - run `pre-commit` before pushing; sign every commit with `git commit -s`
-11. **Model recipe** - add to [vllm-project/recipes](https://github.com/vllm-project/recipes)
+11. **Model recipe** - add under the in-repository `recipes/` directory and update its index
 12. **Invariants** - re-check I1–I5 (streaming contract, consumer hygiene, hot-loop discipline, validation pyramid, per-request state) at the end of every phase
 
 ### Qwen3-TTS Reference Files

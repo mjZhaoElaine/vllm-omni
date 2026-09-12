@@ -6,6 +6,7 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -27,6 +28,8 @@ from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
+
+RECOMPUTE_PREEMPTION_FAIL_MESSAGE = "stage does not support recompute preemption"
 
 
 class SampledLogprobContractError(RuntimeError):
@@ -115,6 +118,104 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._init_omni_io_scheduling_state()
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        self._pending_recompute_preemption_error_requests: list[Request] = []
+        self._apply_recompute_preemption_fail = True
+
+    def _recompute_preemption_policy(self) -> str:
+        return getattr(self.vllm_config.model_config, "recompute_preemption", "allow")
+
+    def _request_has_decode_progress(self, request: Request) -> bool:
+        if len(request.output_token_ids) > 0:
+            return True
+        # First-decode placeholder: last prefill is in flight, confirmed is
+        # prompt_len - 1. Prefill chunks carry no placeholders.
+        if request.num_output_placeholders > 0:
+            return True
+        confirmed = request.num_computed_tokens - request.num_output_placeholders
+        return confirmed > request.num_prompt_tokens
+
+    def _should_fail_recompute_preemption(self, request: Request) -> bool:
+        return (
+            getattr(self, "_apply_recompute_preemption_fail", True)
+            and self._recompute_preemption_policy() == "fail"
+            and self._request_has_decode_progress(request)
+        )
+
+    def reset_prefix_cache(self, *args: Any, **kwargs: Any) -> Any:
+        """Prefix-cache reset shares ``_preempt_request`` but is not KV pressure.
+
+        Disable the fail contract for this call so a user-initiated reset does
+        not terminate live requests with the recompute-preemption message.
+        """
+        previous = getattr(self, "_apply_recompute_preemption_fail", True)
+        self._apply_recompute_preemption_fail = False
+        try:
+            return super().reset_prefix_cache(*args, **kwargs)
+        finally:
+            self._apply_recompute_preemption_fail = previous
+
+    def _preempt_request(
+        self,
+        request: Request,
+        timestamp: float,
+        drop_stale_output: bool = False,
+    ) -> None:
+        if self._should_fail_recompute_preemption(request):
+            self._terminate_recompute_preemption(
+                request,
+                timestamp,
+                drop_stale_output=drop_stale_output,
+            )
+            return
+        super()._preempt_request(request, timestamp, drop_stale_output=drop_stale_output)
+
+    def _terminate_recompute_preemption(
+        self,
+        request: Request,
+        timestamp: float,
+        *,
+        drop_stale_output: bool = False,
+    ) -> None:
+        assert request.status == RequestStatus.RUNNING, (
+            "Only running requests can be terminated for recompute preemption"
+        )
+        lost_tokens = request.num_computed_tokens
+        logger.warning(
+            "Terminating request %s: %d computed tokens cannot be recovered after recompute preemption on this stage.",
+            request.request_id,
+            lost_tokens,
+        )
+        if request.spec_token_ids:
+            request.spec_token_ids = []
+        request.drop_stale_output = drop_stale_output or (
+            getattr(request, "drop_stale_output", False) and getattr(request, "num_stale_output_tokens", 0) > 0
+        )
+        request.num_stale_output_tokens = int(getattr(request, "num_in_flight_tokens", 0) or 0)
+        request.num_output_placeholders = 0
+        request.stop_reason = RECOMPUTE_PREEMPTION_FAIL_MESSAGE
+        request.resumable = False
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
+        self._pending_recompute_preemption_error_requests.append(request)
+        self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
+
+    def _emit_pending_recompute_preemption_errors(
+        self,
+        outputs: dict[int, list[EngineCoreOutput]],
+    ) -> None:
+        pending = self._pending_recompute_preemption_error_requests
+        if not pending:
+            return
+        for request in pending:
+            OmniSchedulerMixin._append_request_output(
+                self,
+                outputs,
+                request,
+                new_token_ids=[],
+                finish_reason=request.get_finished_reason(),
+                stop_reason=request.stop_reason,
+            )
+        pending.clear()
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -366,6 +467,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        self._emit_pending_recompute_preemption_errors(outputs)
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids = None
@@ -763,11 +865,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return engine_core_outputs
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
-        """
-        Override: Only extend prompt at stage 0, and replace
-        the existing session with the next streaming update at other stages.
+        """Apply the next streaming update to a persistent session.
 
-        Discards the last sampled output token from the prior input chunk at stage 0.
+        Stage 0 uses upstream prompt extension. A MiniCPM Talker preserves its
+        accumulated prompt while it fits, then rebuilds a bounded window and
+        re-enters admission. Other downstream stages retain their existing
+        replacement or connector-polling behavior.
+
+        Discards the last sampled output token from the prior input chunk at
+        stage 0.
         """
         req_id = session.request_id
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
@@ -817,6 +923,56 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
                 if self.log_stats:
                     session.record_event(EngineCoreEventType.QUEUED)
+                return
+        streaming_prompt_payload = next(
+            (
+                info
+                for info in update_infos
+                if isinstance(info, dict)
+                and isinstance(info.get("meta"), dict)
+                and "next_stage_prompt_len" in info["meta"]
+            ),
+            None,
+        )
+        update_streaming_prompt = getattr(
+            self.chunk_transfer_adapter,
+            "update_streaming_prompt_for_condition",
+            None,
+        )
+        if stage_id != 0 and streaming_prompt_payload is not None and callable(update_streaming_prompt):
+            mm_feature_base = session.num_computed_tokens
+            try:
+                replaced = update_streaming_prompt(
+                    streaming_prompt_payload,
+                    session,
+                    update_prompt=True,
+                )
+            except ValueError as exc:
+                # This streaming update has already been dequeued. Report the
+                # permanent contract failure so the next scheduling pass
+                # finishes only this request instead of crashing EngineCore.
+                self.chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
+                return
+            if replaced is not None:
+                if replaced:
+                    # The window recipe needs the old prompt and confirmed
+                    # codec ids, so it runs before their KV/encoder state is
+                    # released. The rebuilt prompt is then admitted from zero.
+                    self._release_replaced_streaming_prompt_cache(session)
+                    self._reset_streaming_session_replacement_state(session)
+                else:
+                    session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
+                    if update.mm_features:
+                        # Match upstream streaming-session extension semantics.
+                        # The helper has already appended this condition, so use
+                        # the pre-append confirmed length as the MM offset base.
+                        for mm_feature in update.mm_features:
+                            mm_feature.mm_position = replace(
+                                mm_feature.mm_position,
+                                offset=mm_feature.mm_position.offset + mm_feature_base,
+                            )
+                        session.mm_features.extend(update.mm_features)
+                self._finish_streaming_session_update(session, update)
                 return
         replace_streaming_prompt = any(
             isinstance(info, dict)
