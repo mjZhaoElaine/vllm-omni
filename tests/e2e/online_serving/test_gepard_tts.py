@@ -9,7 +9,6 @@ Zero-shot default voice. Needs a GPU and the NeMo NanoCodec; the weekly
 from __future__ import annotations
 
 import array
-import json
 import os
 import statistics
 import struct
@@ -315,18 +314,10 @@ def _stream_payload(omni_server, text: str, **extra) -> dict:
 class _StreamCapture:
     pcm: bytes
     arrivals: list[tuple[float, int]]
-    wall_s: float
-    ttfp_s: float
 
     @property
     def duration_s(self) -> float:
         return len(self.pcm) / 2 / SAMPLE_RATE
-
-    @property
-    def rtf(self) -> float:
-        if self.duration_s <= 0:
-            return float("inf")
-        return self.wall_s / self.duration_s
 
 
 def _capture_stream(
@@ -350,35 +341,7 @@ def _capture_stream(
             if first and sleep_after_first_s > 0:
                 time.sleep(sleep_after_first_s)
             first = False
-    wall_s = time.perf_counter() - start
-    ttfp_s = arrivals[0][0] if arrivals else wall_s
-    return _StreamCapture(bytes(pcm), arrivals, wall_s, ttfp_s)
-
-
-def _print_serving_baseline(
-    label: str,
-    captures: list[_StreamCapture],
-    *,
-    wall_s: float | None = None,
-) -> dict:
-    wall_s = max(c.wall_s for c in captures) if wall_s is None else wall_s
-    audio_s = sum(c.duration_s for c in captures)
-    ttfp_ms = [c.ttfp_s * 1000.0 for c in captures]
-    rtfs = [c.rtf for c in captures]
-    report = {
-        "label": label,
-        "n": len(captures),
-        "ttfp_ms": [round(v, 1) for v in ttfp_ms],
-        "ttfp_ms_median": round(statistics.median(ttfp_ms), 1),
-        "rtf": [round(v, 3) for v in rtfs],
-        "rtf_median": round(statistics.median(rtfs), 3),
-        "audio_s": round(audio_s, 3),
-        "wall_s": round(wall_s, 3),
-        "throughput_audio_x": round(audio_s / wall_s, 3) if wall_s else 0.0,
-        "throughput_rps": round(len(captures) / wall_s, 3) if wall_s else 0.0,
-    }
-    print(f"SERVING_BASELINE={json.dumps(report, separators=(',', ':'))}")
-    return report
+    return _StreamCapture(bytes(pcm), arrivals)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -410,34 +373,6 @@ def test_concurrent_streaming_stays_isolated(omni_server, run_level: str) -> Non
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_concurrent_streaming_ttfa_rtf_baseline(omni_server) -> None:
-    """Record eager serving TTFP/RTF/throughput. No pass threshold."""
-    url = _speech_url(omni_server)
-    text = "Hello, this is Gepard speaking."
-    solo = _capture_stream(url, _stream_payload(omni_server, text), DEFAULT_TIMEOUT_S)
-    assert len(solo.arrivals) >= 2
-    _print_serving_baseline("concurrency=1", [solo])
-
-    texts = list(_DISTINGUISHABLE_PROMPTS)
-
-    def _one(prompt: str) -> _StreamCapture:
-        return _capture_stream(url, _stream_payload(omni_server, prompt), DEFAULT_TIMEOUT_S)
-
-    t0 = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        concurrent = list(pool.map(_one, texts))
-    group_wall = time.perf_counter() - t0
-    assert all(len(c.arrivals) >= 2 for c in concurrent)
-    report = _print_serving_baseline("concurrency=4", concurrent, wall_s=group_wall)
-    report["group_wall_s"] = round(group_wall, 3)
-    report["ttfp_degrade_x"] = round(report["ttfp_ms_median"] / (solo.ttfp_s * 1000.0), 3)
-    report["rtf_degrade_x"] = round(report["rtf_median"] / solo.rtf, 3) if solo.rtf else None
-    print(f"SERVING_BASELINE_DEGRADE={json.dumps(report, separators=(',', ':'))}")
-    _scan_logs_for_preemption(omni_server)
-
-
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_slow_client_still_completes(omni_server, online_client) -> None:
     """Slow reader must finish, and seed=7 must match a prior non-stream.
 
@@ -458,10 +393,7 @@ def test_slow_client_still_completes(omni_server, online_client) -> None:
     assert len(cap.arrivals) >= 2
     assert len(cap.pcm) % PCM16_BYTES_PER_FRAME == 0
     assert 0.5 < cap.duration_s < 30.0
-    print(
-        f"[Gepard slow-client] chunks={len(cap.arrivals)} duration_s={cap.duration_s:.3f} "
-        f"ttfp_ms={cap.ttfp_s * 1000.0:.1f}"
-    )
+    print(f"[Gepard slow-client] chunks={len(cap.arrivals)} duration_s={cap.duration_s:.3f}")
     _pcm16_diag("slow-vs-prior-nonstream", cap.pcm, baseline.audio_bytes)
     [after] = online_client.send_audio_speech_request(
         _base_config(omni_server, text, seed=7, stream=False, response_format="pcm")
