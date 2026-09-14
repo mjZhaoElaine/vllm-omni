@@ -10,6 +10,12 @@
 #
 # Packaged deploy config: vllm_omni/deploy/gepard.yaml (async_chunk=false,
 # 22.05 kHz mono, default seed 42 until the YAML seed is removed).
+# Cold start downloads the talker and NeMo NanoCodec; the serve default of
+# --stage-init-timeout 300 is too tight (offline end2end.py uses 900).
+#
+# On a host whose CUDA toolkit cannot JIT FlashInfer (no nvcc/ninja, or a
+# consumer Blackwell sm_120 card), also:
+#   export VLLM_USE_FLASHINFER_SAMPLER=0
 
 set -e
 
@@ -23,4 +29,5 @@ vllm-omni serve "$MODEL" \
     --port "$PORT" \
     --trust-remote-code \
     --omni \
+    --stage-init-timeout 900 \
     --deploy-config vllm_omni/deploy/gepard.yaml

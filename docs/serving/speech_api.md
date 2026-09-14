@@ -44,12 +44,18 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
 
 # Gepard-1.0 (zero-shot default voice; packaged gepard.yaml)
 vllm-omni serve nineninesix/gepard-1.0 --omni --port 8091 --trust-remote-code \
+    --stage-init-timeout 900 \
     --deploy-config vllm_omni/deploy/gepard.yaml
 ```
 
 ### Generate Speech
 
-**Using curl:**
+Request shape is **model-specific**. The first examples match the Qwen3-TTS
+CustomVoice server above. `voice: "vivian"` and `language: "English"` are
+Qwen3 fields — Gepard rejects both (`voice` must be omitted or `"default"`;
+`language` returns 400).
+
+**Qwen3-TTS CustomVoice, using curl:**
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -61,7 +67,19 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --output output.wav
 ```
 
-**Using Python:**
+**Gepard-1.0, using curl:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is Gepard speaking.",
+        "voice": "default",
+        "seed": 7
+    }' --output output.wav
+```
+
+**Qwen3-TTS CustomVoice, using Python:**
 
 ```python
 import httpx
@@ -80,7 +98,7 @@ with open("output.wav", "wb") as f:
     f.write(response.content)
 ```
 
-**Using OpenAI SDK:**
+**Using OpenAI SDK (Qwen3-TTS CustomVoice):**
 
 ```python
 from openai import OpenAI
@@ -110,7 +128,7 @@ Content-Type: application/json
 #### OpenAI Standard Parameters
 
 | Parameter | Type | Default | Description |
-| ----------- | ------ | --------- | ------------- |
+ | --------- | ---- | ------- | ----------- |
 | `input` | string | **required** | The text to synthesize into speech |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
 | `voice` | string | "vivian" | Speaker name (e.g., vivian, ryan, aiden) |
@@ -120,9 +138,8 @@ Content-Type: application/json
 #### vLLM-Omni Extension Parameters
 
 | Parameter | Type | Default | Description |
-| ----------- | ------ | --------- | ------------- |
-| `task_type` | string | null (inferred) | TTS task type: CustomVoice, VoiceDesign, or Base. For Qwen3-TTS, `ref_audio` or `ref_text` infers Base when this field is omitted, while an uploaded/precomputed voice always selects Base. Other omitted values select CustomVoice; VoiceDesign must be specified explicitly. |
-| `sample_rate` | integer | model native | Target output sample rate. Qwen3-TTS supports 8000 or 24000 Hz; the model remains native 24 kHz internally and is resampled before encoding. |
+ | --------- | ---- | ------- | ----------- |
+| `task_type` | string | "CustomVoice" | TTS task type: CustomVoice, VoiceDesign, or Base |
 | `language` | string | "Auto" | Language (see supported languages below) |
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
@@ -136,7 +153,7 @@ Content-Type: application/json
 #### Voice Clone Parameters (Base task)
 
 | Parameter | Type | Default | Description |
-| ----------- | ------ | --------- | ------------- |
+ | --------- | ---- | ------- | ----------- |
 | `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`). Local files fold `mtime_ns` and `size` into cache keys to automatically reload on-disk edits; HTTP URLs and base64 URIs remain cached by string locator. |
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
@@ -152,7 +169,7 @@ non-streaming responses from non-diffusion speech servers report usage through
 response headers:
 
 | Header | Description |
-| --- | --- |
+ | ------ | ----------- |
 | `x-vllm-omni-input-tokens` | Total input tokens (`text_tokens` + `audio_tokens`). |
 | `x-vllm-omni-output-tokens` | Generated codec/audio tokens. |
 | `x-vllm-omni-total-tokens` | `input_tokens` + `output_tokens`. |
@@ -245,7 +262,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 **Form Parameters:**
 
 | Parameter | Type | Required | Description |
-| ----------- | ------ | ---------- | ------------- |
+ | --------- | ---- | -------- | ----------- |
 | `audio_sample` | file | Yes | Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm, mp4) |
 | `consent` | string | Yes | Consent recording ID |
 | `name` | string | Yes | Name for the new voice |
@@ -299,7 +316,7 @@ at each detected boundary (lower time-to-first-audio for STT/LLM pipelines).
 Client -> Server:
 
 | Message | Description |
-| --------- | ------------- |
+ | ------- | ----------- |
 | `{"type": "session.config", ...}` | Session configuration (first message; may be resent between utterances to change it) |
 | `{"type": "input.text", "text": "..."}` | Text chunk |
 | `{"type": "input.done"}` | End of utterance: flushes the buffer and keeps the connection open |
@@ -308,7 +325,7 @@ Client -> Server:
 Server -> Client:
 
 | Message | Description |
-| --------- | ------------- |
+ | ------- | ----------- |
 | `{"type": "audio.start", "utterance_index": 0, "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for the buffered input |
 | Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
 | `{"type": "audio.done", "utterance_index": 0, "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for the buffered input |
@@ -324,16 +341,14 @@ upstream LLM) pays the WebSocket handshake once instead of once per utterance.
 
 - The session config is sticky. Send `input.text` again straight after
   `session.done` to reuse it, or send another `session.config` first to change
-  voice, format, or reference audio. A `session.config` sent in the middle of
-  an utterance is rejected so no pending input is silently dropped and so a
-  split utterance cannot end up half in one voice and half in another.
-- An utterance is the flush unit, not a linguistic one: it is one `input.done`
-  cycle. `utterance_index` counts those flushes across the connection, so it
-  tells you which `input.done` a frame belongs to. `sentence_index` counts the
-  TTS requests inside one flush and so pairs with `total_sentences`: with the
-  default `split_granularity=none` that is always `sentence_index: 0` of
-  `total_sentences: 1` (or `0` for an empty buffer), while `sentence` or
-  `clause` counts the linguistic units actually synthesized.
+  voice, format, or reference audio. A `session.config` sent while text is
+  still buffered is rejected so no pending input is silently dropped.
+- An utterance is the flush unit, not a linguistic one: it is whatever text was
+  buffered when `input.done` arrived, of any length, synthesized as one request.
+  `utterance_index` counts those flushes across the connection, so it tells you
+  which `input.done` a frame belongs to. `sentence_index` counts within one
+  flush and so pairs with `total_sentences`, which means every utterance reports
+  `sentence_index: 0` of `total_sentences: 1` (or `0` for an empty buffer).
 - End the connection with `session.close`, or by closing the socket. An idle
   connection is still closed after the server's idle timeout, which now also
   applies to the gap between utterances.
@@ -343,16 +358,8 @@ upstream LLM) pays the WebSocket handshake once instead of once per utterance.
 All REST API parameters are supported, plus:
 
 | Parameter | Type | Default | Description |
-| ----------- | ------ | --------- | ------------- |
-| `stream_audio` | bool | false | Stream one or more PCM chunks for each TTS request over WebSocket |
-| `split_granularity` | string | `"none"` | `"none"`: one request per `input.done`. `"sentence"`: split on `.!?` plus CJK `。！？…`, Indic danda `।॥`, and Arabic `؟`. `"clause"`: also split on `,;，；،؛`. |
-| `seed` | integer | null | Forwarded to the speech engine for this session |
-
-ASCII punctuation only ends a unit when whitespace or `input.done` follows it,
-and decimals (`3.14`), thousands separators (`1,000`), abbreviations (`Dr.`,
-`e.g.`) and initials (`J. R.`) are not treated as boundaries. A punctuation run
-and any closing quote or bracket stay with the unit they close, so `Wait...`
-and `He said "Hello."` are one request each.
+ | --------- | ---- | ------- | ----------- |
+| `stream_audio` | bool | false | Stream one or more PCM chunks for the buffered input over WebSocket |
 
 ```bash
 DELETE /v1/audio/voices/{name}
@@ -363,7 +370,7 @@ Delete an uploaded voice sample.
 **Path Parameters:**
 
 | Parameter | Type | Required | Description |
-| ----------- | ------ | ---------- | ------------- |
+ | --------- | ---- | -------- | ----------- |
 | `name` | string | Yes | Name of the voice to delete |
 
 **Response Example:**
@@ -547,7 +554,7 @@ by `GET /v1/audio/voices`. Valid precomputed voices can be used in
 **Configuration (environment variables):**
 
 | Variable | Default | Description |
-| ---------- | --------- | ------------- |
+ | -------- | ------- | ----------- |
 | `SPEAKER_SAMPLES_DIR` | `~/.cache/vllm-omni/speakers` | Directory for persisted uploaded speakers (`.safetensors` files). |
 | `SPEAKER_MAX_UPLOADED` | `1000` | Maximum number of uploaded speakers kept on disk. Upload requests past the cap return 400. |
 
@@ -567,7 +574,7 @@ Content-Type: application/json
 ### Request Parameters
 
 | Parameter | Type | Default | Description |
-| ----------- | ------ | --------- | ------------- |
+ | --------- | ---- | ------- | ----------- |
 | `items` | array | **required** | List of items to synthesize (1–32) |
 | `model` | string | server's model | Model to use |
 | `voice` | string | null | Default voice for all items |
@@ -584,7 +591,7 @@ Content-Type: application/json
 Each item in the `items` array requires only `input` (the text). All other fields are optional and override the batch-level defaults when set:
 
 | Field | Type | Description |
-| ------- | ------ | ------------- |
+ | ----- | ---- | ----------- |
 | `input` | string | **required** — text to synthesize |
 | `voice` | string | Override voice for this item |
 | `response_format` | string | Override format for this item |
@@ -716,7 +723,7 @@ for result in response.json()["results"]:
 ### Configuration
 
 | Parameter | Source | Default | Description |
-| ----------- | -------- | --------- | ------------- |
+ | --------- | ------ | ------- | ----------- |
 | `tts_batch_max_items` | engine kwarg | 32 | Maximum number of items per batch request |
 
 All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_num_seqs` and queues the rest — no client-side throttling needed.
@@ -739,7 +746,7 @@ The bundled config also sets `initial_codec_chunk_frames: 1`. This emits only th
 ### Qwen3-TTS
 
 | Model | Task Type | Description |
-| ------- | ----------- | ------------- |
+ | ----- | --------- | ----------- |
 | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | CustomVoice | Predefined speaker voices with optional style control |
 | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | VoiceDesign | Natural language voice style description |
 | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Base | Voice cloning from reference audio or an uploaded/precomputed voice |
@@ -749,7 +756,7 @@ The bundled config also sets `initial_codec_chunk_frames: 1`. This emits only th
 ### Fish Speech S2 Pro
 
 | Model | Description |
-| ------- | ------------- |
+ | ----- | ----------- |
 | `fishaudio/s2-pro` | 4B dual-AR TTS with DAC codec (44.1 kHz). Supports text-to-speech and voice cloning. |
 
 Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. See the [Fish Speech section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#fish-speech-s2-pro) for details.
@@ -757,25 +764,25 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 ### Voxtral TTS
 
 | Model | Description |
-| ------- | ------------- |
+ | ----- | ----------- |
 | `mistralai/Voxtral-4B-TTS-2603` | 3B AR + FlowMatching TTS. Supports text-to-speech with preset voices. |
 
 ### CosyVoice3
 
 | Model | Description |
-| ------- | ------------- |
+ | ----- | ----------- |
 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | Voice cloning from `ref_audio` + `ref_text`. No built-in voice presets — upload a voice or pass `ref_audio`/`ref_text` per request. |
 
 ### Gepard-1.0
 
 | Model | Description |
-|-------|-------------|
+ | ----- | ----------- |
 | `nineninesix/gepard-1.0` | Zero-shot native-AR TTS. 22.05 kHz mono. `voice` must be omitted or `"default"`. |
 
 Gepard request fields:
 
 | Field | Behavior |
-|---|---|
+ | ----- | -------- |
 | `input` | Required. Empty/whitespace-only returns 400. |
 | `voice` | Omitted or `"default"` only. Other values 400. |
 | `response_format` | `wav` default. Non-streaming: `wav`/`pcm`/`flac`/`mp3`. `opus` returns 400 (22.05 kHz is not an Opus sample rate). Streaming: `pcm`/`wav` only. |
@@ -786,12 +793,12 @@ Gepard request fields:
 | `extra_params` | Any key returns 400, including `temperature`/`top_p`/`top_k`. |
 | Cloning / style fields | `ref_audio`, `ref_text`, `speaker_embedding`, `instructions`, `language`, `task_type`, `word_timestamps`, and similar declared-but-unsupported fields return 400. |
 
-See the [Gepard section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#gepard-10) for launch commands. Native-AR recompute preemption is a known limitation under concurrency.
+See the [Gepard section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#gepard-10) for launch commands and a working curl (`voice: "default"`, no `language`). Native-AR recompute preemption is a known limitation under concurrency.
 
 ### OmniVoice
 
 | Model | Description |
-| ------- | ------------- |
+ | ----- | ----------- |
 | `k2-fsa/OmniVoice` | Pure-diffusion TTS. Supports voice cloning via `ref_audio` (with optional `ref_text`); no built-in voice presets. |
 
 OmniVoice uses packed variable-length attention for batched generator execution. The attention operator accepts FP16 and BF16 inputs, so its query,
@@ -801,7 +808,7 @@ hidden-state dtype before the output projection. Consequently, a float32 stage c
 ### VoxCPM2
 
 | Model | Description |
-| ------- | ------------- |
+ | ----- | ----------- |
 | `openbmb/VoxCPM2` | TTS + voice cloning with built-in speaker presets and uploaded-voice support. Accepts `voice` (preset or uploaded) or `ref_audio` + optional `ref_text`. |
 
 #### Startup LoRA adapter
@@ -841,7 +848,7 @@ parity should be checked against the upstream adapter on your deployment.
 ### MOSS-TTS-Nano
 
 | Model | Description |
-| ------- | ------------- |
+ | ----- | ----------- |
 | `OpenMOSS-Team/MOSS-TTS-Nano` | Voice cloning only. Requires `ref_audio` (or an uploaded `voice`); no built-in voice presets. `ref_text` is accepted but ignored — upstream's `voice_clone` mode does not consume a transcript. |
 
 ### Breeze-TTS-2
@@ -938,7 +945,7 @@ final-output drain to a condition-variable wakeup at the same time.
 **Configuration (environment variables):**
 
 | Variable | Default | Description |
-| --- | --- | --- |
+ | -------- | ------- | ----------- |
 | `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `0` (off) | Switches the orchestration loop and the final-output drain from the legacy 1 ms poll to event-driven wakeups. Enabled by `1`, `true`, `yes`, or `on`, matched case-insensitively after surrounding whitespace is stripped; any other value leaves it off. |
 
 Set it on the process that runs the orchestrator (stage 0 of an omni

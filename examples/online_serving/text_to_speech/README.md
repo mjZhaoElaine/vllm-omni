@@ -97,7 +97,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
 
-Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for IndexTTS-2, and 24 kHz for many others).
+Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for Gepard and IndexTTS-2, and 24 kHz for many others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
 
@@ -108,19 +108,25 @@ For full request-shape documentation (all parameters, response formats, error co
 Single-stage native AR TTS at 22.05 kHz mono. Zero-shot only: omit `voice` or pass `"default"`. Voice cloning from reference audio is not available yet.
 
 ### Prerequisites
-Same NeMo NanoCodec install as the [offline Gepard section](../../offline_inference/text_to_speech/README.md#gepard-10).
+
+Same NeMo NanoCodec install as the [offline Gepard section](../../offline_inference/text_to_speech/README.md#gepard-10). On a host whose CUDA toolkit cannot build kernels — no `nvcc`/`ninja`, or a consumer Blackwell (`sm_120`) card — also `export VLLM_USE_FLASHINFER_SAMPLER=0` before launch (same note as offline). That env is not a deploy-YAML field.
 
 ### Launch
+
 ```bash
 vllm-omni serve nineninesix/gepard-1.0 --omni --port 8091 --trust-remote-code \
+    --stage-init-timeout 900 \
     --deploy-config vllm_omni/deploy/gepard.yaml
 # or:
 ./gepard/run_server.sh
 ```
 
+`--stage-init-timeout 900` matches the online e2e fixture and the offline example. Serve defaults to 300s, which is often too short for a cold download of the talker plus NanoCodec.
+
 The packaged `vllm_omni/deploy/gepard.yaml` must be passed with `--deploy-config`. The checkpoint self-identifies as `qwen3_5_text`, so omitting the YAML launches a diffusion fallback instead of the Gepard pipeline. The YAML sets `async_chunk: false`, `max_num_seqs: 4`, and currently pins `seed: 42`, so serving is deterministic by default until that YAML seed is removed. Pass an explicit per-request `seed` in tests and clients rather than depending on either default.
 
 ### Sending requests
+
 ```bash
 python examples/online_serving/text_to_speech/gepard/speech_client.py \
     --text "Hello, this is Gepard speaking."
@@ -130,6 +136,7 @@ python examples/online_serving/text_to_speech/gepard/speech_client.py \
 ```
 
 ### Notes
+
 - Output: 22.05 kHz mono. `max_new_tokens` is a **frame** budget (1 token = 1 frame = 1024 samples ≈ 46.4 ms at 21.5 fps; adapter bounds 1..4096).
 - Supported request fields: `input` (required), `voice` (`default` only), `response_format` (`wav` default; `wav/pcm/flac/mp3` non-streaming; `opus` 400 because 22.05 kHz is not an Opus sample rate; streaming `pcm/wav` only), `stream` / `stream_format`, `max_new_tokens`, `seed`.
 - Rejected: `speed != 1.0`, any `extra_params` key (including `temperature`/`top_p`/`top_k`), cloning fields (`ref_audio`, `ref_text`, `speaker_embedding`, …), Qwen3-only `task_type`/`instructions`/`language`, and `word_timestamps`.
@@ -258,11 +265,6 @@ python examples/online_serving/text_to_speech/indextts2/speech_client.py \
 0.6B DualAR TTS at 44.1 kHz, 11 languages, zero-shot voice cloning.
 
 ### Prerequisites
-
-None beyond the base install: the neural audio codec is implemented in tree and
-its weights (`codec.pth`) ship with the checkpoint.
-
-### Launch
 
 ```bash
 vllm serve Audio8/Audio8-TTS-Preview-0.6b --omni --port 8092
@@ -787,16 +789,11 @@ curl -X POST http://localhost:8091/v1/audio/voices \
     -F "speaker_description=warm narrator"
 ```
 
-For Qwen3-TTS, uploaded voices are Base voice-cloning inputs and require a Base
-checkpoint. When a request names an uploaded voice, the server infers
-`task_type="Base"`. Built-in presets such as `vivian` and `ryan` remain
-CustomVoice speakers and require a CustomVoice checkpoint.
+Uploaded voices are then usable as `voice="custom_voice_1"` on subsequent requests.
 
 ### Precomputed custom voices
 
-For reused Base voice-cloning speakers, precompute the reference artifacts once
-and load them at server startup. Precomputed voices use the same Base task and
-checkpoint-matching rules as uploaded voices:
+For reused Base voice-cloning speakers, precompute the reference artifacts once and load them at server startup:
 
 ```bash
 python qwen3_tts/precompute_custom_voice.py \
@@ -844,7 +841,7 @@ Raw PCM streaming requires `stream_format="audio"`, `response_format="pcm"`, and
 
 ### Streaming WebSocket
 
-The `/v1/audio/speech/stream` endpoint accepts text incrementally and, by default, synthesizes the buffered text as one continuous request on `input.done`:
+The `/v1/audio/speech/stream` endpoint accepts text incrementally and synthesizes the buffered text as one continuous request on `input.done`:
 
 ```bash
 python qwen3_tts/streaming_speech_client.py --text "Hello world. How are you? I am fine."
