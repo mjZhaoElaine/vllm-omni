@@ -50,11 +50,6 @@ vllm-omni serve nineninesix/gepard-1.0 --omni --port 8091 --trust-remote-code \
 
 ### Generate Speech
 
-Request shape is **model-specific**. The first examples match the Qwen3-TTS
-CustomVoice server above. `voice: "vivian"` and `language: "English"` are
-Qwen3 fields — Gepard rejects both (`voice` must be omitted or `"default"`;
-`language` returns 400).
-
 **Qwen3-TTS CustomVoice, using curl:**
 
 ```bash
@@ -68,6 +63,11 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 ```
 
 **Gepard-1.0, using curl:**
+
+Gepard accepts `input` (required), `voice` (`"default"`), `response_format`,
+`stream` / `stream_format`, `max_new_tokens`, and `seed`. Unsupported fields
+include `speed`, `language`, `instructions`, `task_type`, `ref_audio`,
+`ref_text`, `extra_params`, and `word_timestamps`.
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -793,7 +793,7 @@ Gepard request fields:
 | `extra_params` | Any key returns 400, including `temperature`/`top_p`/`top_k`. |
 | Cloning / style fields | `ref_audio`, `ref_text`, `speaker_embedding`, `instructions`, `language`, `task_type`, `word_timestamps`, and similar declared-but-unsupported fields return 400. |
 
-See the [Gepard section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#gepard-10) for launch commands and a working curl (`voice: "default"`, no `language`). Native-AR recompute preemption is a known limitation under concurrency.
+See the [Gepard section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#gepard-10) for launch commands. Native-AR recompute preemption is a known limitation under concurrency.
 
 ### OmniVoice
 
