@@ -8,10 +8,15 @@ Zero-shot default voice. Needs a GPU and the NeMo NanoCodec; the weekly
 
 from __future__ import annotations
 
+import array
+import json
 import os
+import statistics
 import struct
 import time
+import wave
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from io import BytesIO
 
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
@@ -78,6 +83,51 @@ def _wav_sample_rate(wav_bytes: bytes) -> int:
 def _wav_pcm_payload_len(wav_bytes: bytes) -> int:
     data, _sr = sf.read(BytesIO(wav_bytes), dtype="int16")
     return int(data.size) * 2
+
+
+def _pcm16le_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
+    """Whisper helpers expect a container; streamed speech is raw s16le."""
+    buf = BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _pcm16_samples(pcm: bytes) -> array.array:
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    return samples
+
+
+def _pcm16_diag(label: str, left: bytes, right: bytes) -> None:
+    extra_frames = (len(left) - len(right)) // PCM16_BYTES_PER_FRAME
+    overlap = min(len(left), len(right))
+    first_frame_match = (
+        overlap >= PCM16_BYTES_PER_FRAME and left[:PCM16_BYTES_PER_FRAME] == right[:PCM16_BYTES_PER_FRAME]
+    )
+    worst = None
+    corr = None
+    first_diff_sample = None
+    if overlap >= 2 and overlap % 2 == 0:
+        a = _pcm16_samples(left[:overlap])
+        b = _pcm16_samples(right[:overlap])
+        worst = max(abs(x - y) for x, y in zip(a, b, strict=True))
+        for i, (x, y) in enumerate(zip(a, b, strict=True)):
+            if x != y:
+                first_diff_sample = i
+                break
+        try:
+            corr = round(statistics.correlation(a, b), 6)
+        except statistics.StatisticsError:
+            corr = None
+    print(
+        f"[Gepard pcm-diag] {label} left={len(left)} right={len(right)} "
+        f"extra_frames={extra_frames} first_frame_match={first_frame_match} "
+        f"first_diff_sample={first_diff_sample} max_abs={worst} corr={corr}"
+    )
 
 
 def _scan_logs_for_preemption(omni_server) -> None:
@@ -241,3 +291,302 @@ def test_concurrent_requests_stay_isolated(omni_server, online_client, run_level
             assert keyword in transcript, f"expected {keyword!r} in {transcript!r} for {text!r}"
 
     _scan_logs_for_preemption(omni_server)
+
+
+def _speech_url(omni_server) -> str:
+    return f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
+
+
+def _stream_payload(omni_server, text: str, **extra) -> dict:
+    payload = {
+        "model": omni_server.model,
+        "input": text,
+        "voice": "default",
+        "seed": 7,
+        "stream": True,
+        "stream_format": "audio",
+        "response_format": "pcm",
+    }
+    payload.update(extra)
+    return payload
+
+
+@dataclass
+class _StreamCapture:
+    pcm: bytes
+    arrivals: list[tuple[float, int]]
+    wall_s: float
+    ttfp_s: float
+
+    @property
+    def duration_s(self) -> float:
+        return len(self.pcm) / 2 / SAMPLE_RATE
+
+    @property
+    def rtf(self) -> float:
+        if self.duration_s <= 0:
+            return float("inf")
+        return self.wall_s / self.duration_s
+
+
+def _capture_stream(
+    url: str,
+    payload: dict,
+    timeout_s: float,
+    *,
+    sleep_after_first_s: float = 0.0,
+) -> _StreamCapture:
+    start = time.perf_counter()
+    arrivals: list[tuple[float, int]] = []
+    pcm = bytearray()
+    with requests.post(url, json=payload, stream=True, timeout=timeout_s) as resp:
+        resp.raise_for_status()
+        first = True
+        for chunk in resp.iter_content(chunk_size=None):
+            if not chunk:
+                continue
+            arrivals.append((time.perf_counter() - start, len(chunk)))
+            pcm.extend(chunk)
+            if first and sleep_after_first_s > 0:
+                time.sleep(sleep_after_first_s)
+            first = False
+    wall_s = time.perf_counter() - start
+    ttfp_s = arrivals[0][0] if arrivals else wall_s
+    return _StreamCapture(bytes(pcm), arrivals, wall_s, ttfp_s)
+
+
+def _print_serving_baseline(
+    label: str,
+    captures: list[_StreamCapture],
+    *,
+    wall_s: float | None = None,
+) -> dict:
+    wall_s = max(c.wall_s for c in captures) if wall_s is None else wall_s
+    audio_s = sum(c.duration_s for c in captures)
+    ttfp_ms = [c.ttfp_s * 1000.0 for c in captures]
+    rtfs = [c.rtf for c in captures]
+    report = {
+        "label": label,
+        "n": len(captures),
+        "ttfp_ms": [round(v, 1) for v in ttfp_ms],
+        "ttfp_ms_median": round(statistics.median(ttfp_ms), 1),
+        "rtf": [round(v, 3) for v in rtfs],
+        "rtf_median": round(statistics.median(rtfs), 3),
+        "audio_s": round(audio_s, 3),
+        "wall_s": round(wall_s, 3),
+        "throughput_audio_x": round(audio_s / wall_s, 3) if wall_s else 0.0,
+        "throughput_rps": round(len(captures) / wall_s, 3) if wall_s else 0.0,
+    }
+    print(f"SERVING_BASELINE={json.dumps(report, separators=(',', ':'))}")
+    return report
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_concurrent_streaming_stays_isolated(omni_server, run_level: str) -> None:
+    url = _speech_url(omni_server)
+    texts = list(_DISTINGUISHABLE_PROMPTS)
+
+    def _one(text: str) -> tuple[str, _StreamCapture]:
+        return text, _capture_stream(url, _stream_payload(omni_server, text), DEFAULT_TIMEOUT_S)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(_one, texts))
+
+    captures = [cap for _, cap in results]
+    assert all(len(c.arrivals) >= 2 for c in captures)
+    for i in range(len(captures)):
+        for j in range(i + 1, len(captures)):
+            assert captures[i].pcm != captures[j].pcm
+
+    if run_level in {"advanced_model", "full_model"}:
+        for text, cap in results:
+            keyword = _DISTINGUISHABLE_PROMPTS[text]
+            transcript = convert_audio_bytes_to_text(_pcm16le_to_wav(cap.pcm), language="en").lower()
+            assert keyword in transcript, f"expected {keyword!r} in {transcript!r} for {text!r}"
+
+    _scan_logs_for_preemption(omni_server)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_concurrent_streaming_ttfa_rtf_baseline(omni_server) -> None:
+    """Record eager serving TTFP/RTF/throughput. No pass threshold."""
+    url = _speech_url(omni_server)
+    text = "Hello, this is Gepard speaking."
+    solo = _capture_stream(url, _stream_payload(omni_server, text), DEFAULT_TIMEOUT_S)
+    assert len(solo.arrivals) >= 2
+    _print_serving_baseline("concurrency=1", [solo])
+
+    texts = list(_DISTINGUISHABLE_PROMPTS)
+
+    def _one(prompt: str) -> _StreamCapture:
+        return _capture_stream(url, _stream_payload(omni_server, prompt), DEFAULT_TIMEOUT_S)
+
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        concurrent = list(pool.map(_one, texts))
+    group_wall = time.perf_counter() - t0
+    assert all(len(c.arrivals) >= 2 for c in concurrent)
+    report = _print_serving_baseline("concurrency=4", concurrent, wall_s=group_wall)
+    report["group_wall_s"] = round(group_wall, 3)
+    report["ttfp_degrade_x"] = round(report["ttfp_ms_median"] / (solo.ttfp_s * 1000.0), 3)
+    report["rtf_degrade_x"] = round(report["rtf_median"] / solo.rtf, 3) if solo.rtf else None
+    print(f"SERVING_BASELINE_DEGRADE={json.dumps(report, separators=(',', ':'))}")
+    _scan_logs_for_preemption(omni_server)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_slow_client_still_completes(omni_server, online_client) -> None:
+    """Slow reader must finish, and seed=7 must match a prior non-stream.
+
+    Runs before ``test_client_disconnect_releases_capacity`` so an abort
+    storm cannot contaminate this comparison. Prints overlap diagnostics
+    before the bit-exact asserts.
+    """
+    text = "Hello, this is Gepard speaking."
+    [baseline] = online_client.send_audio_speech_request(
+        _base_config(omni_server, text, seed=7, stream=False, response_format="pcm")
+    )
+    cap = _capture_stream(
+        url=_speech_url(omni_server),
+        payload=_stream_payload(omni_server, text),
+        timeout_s=DEFAULT_TIMEOUT_S,
+        sleep_after_first_s=3.0,
+    )
+    assert len(cap.arrivals) >= 2
+    assert len(cap.pcm) % PCM16_BYTES_PER_FRAME == 0
+    assert 0.5 < cap.duration_s < 30.0
+    print(
+        f"[Gepard slow-client] chunks={len(cap.arrivals)} duration_s={cap.duration_s:.3f} "
+        f"ttfp_ms={cap.ttfp_s * 1000.0:.1f}"
+    )
+    _pcm16_diag("slow-vs-prior-nonstream", cap.pcm, baseline.audio_bytes)
+    [after] = online_client.send_audio_speech_request(
+        _base_config(omni_server, text, seed=7, stream=False, response_format="pcm")
+    )
+    _pcm16_diag("after-nonstream-vs-prior", after.audio_bytes, baseline.audio_bytes)
+    assert cap.pcm == baseline.audio_bytes
+    assert after.audio_bytes == baseline.audio_bytes
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_client_disconnect_releases_capacity(omni_server, online_client) -> None:
+    """A follow-up request must complete after in-flight streams are closed.
+
+    Logs PCM diagnostics against a pre-abort ``seed=7`` baseline. Bit-exact
+    equality after abort is not asserted here: a dying stream can still share
+    a GPU batch with the next generate after ``abort()`` returns, and Gepard's
+    in-model stop head / bf16 GEMM are not row-stable in that batch.
+    """
+    url = _speech_url(omni_server)
+    text = "Hello, this is Gepard speaking."
+    [baseline] = online_client.send_audio_speech_request(
+        _base_config(omni_server, text, seed=7, stream=False, response_format="pcm")
+    )
+    long_payload = _stream_payload(
+        omni_server,
+        "Please keep talking about the weather, the window, coffee, and purple flowers.",
+        max_new_tokens=80,
+    )
+    for _ in range(4):
+        resp = requests.post(url, json=long_payload, stream=True, timeout=DEFAULT_TIMEOUT_S)
+        resp.raise_for_status()
+        try:
+            chunk = next(c for c in resp.iter_content(chunk_size=None) if c)
+            assert chunk
+        finally:
+            resp.close()
+
+    t0 = time.perf_counter()
+    follow = requests.post(
+        url,
+        json={
+            "model": omni_server.model,
+            "input": text,
+            "voice": "default",
+            "seed": 7,
+            "stream": False,
+            "response_format": "pcm",
+        },
+        timeout=DEFAULT_TIMEOUT_S,
+    )
+    follow.raise_for_status()
+    elapsed = time.perf_counter() - t0
+    pcm_len = len(follow.content)
+    assert pcm_len % PCM16_BYTES_PER_FRAME == 0
+    print(f"[Gepard disconnect] followup_s={elapsed:.2f} pcm_bytes={pcm_len}")
+    _pcm16_diag("disconnect-followup-vs-prior", follow.content, baseline.audio_bytes)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_mixed_stream_and_nonstream_isolated(omni_server, online_client, run_level: str) -> None:
+    url = _speech_url(omni_server)
+    stream_text = "He drinks coffee every morning."
+    nonstream_text = "My favorite color is purple."
+
+    def _stream():
+        return _capture_stream(url, _stream_payload(omni_server, stream_text), DEFAULT_TIMEOUT_S)
+
+    def _nonstream():
+        return online_client.send_audio_speech_request(
+            _base_config(omni_server, nonstream_text, seed=7, response_format="wav")
+        )[0]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        stream_future = pool.submit(_stream)
+        nonstream_future = pool.submit(_nonstream)
+        streamed = stream_future.result()
+        nonstream = nonstream_future.result()
+
+    assert streamed.pcm
+    assert nonstream.success
+    assert streamed.pcm != nonstream.audio_bytes
+    if run_level in {"advanced_model", "full_model"}:
+        stream_tr = convert_audio_bytes_to_text(_pcm16le_to_wav(streamed.pcm), language="en").lower()
+        nonstream_tr = convert_audio_bytes_to_text(nonstream.audio_bytes, language="en").lower()
+        assert "coffee" in stream_tr, stream_tr
+        assert "purple" in nonstream_tr, nonstream_tr
+    _scan_logs_for_preemption(omni_server)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_max_new_tokens_caps_whole_frames(omni_server) -> None:
+    frames = 16
+    url = _speech_url(omni_server)
+    r = requests.post(
+        url,
+        json={
+            "model": omni_server.model,
+            "input": "Hello, this is Gepard speaking.",
+            "voice": "default",
+            "seed": 7,
+            "stream": False,
+            "response_format": "pcm",
+            "max_new_tokens": frames,
+        },
+        timeout=DEFAULT_TIMEOUT_S,
+    )
+    assert r.status_code == 200, r.text
+    pcm_len = len(r.content)
+    assert pcm_len % PCM16_BYTES_PER_FRAME == 0
+    assert pcm_len == frames * PCM16_BYTES_PER_FRAME, f"got {pcm_len} bytes, want {frames} frames"
+    duration = pcm_len / 2 / SAMPLE_RATE
+    assert duration < 1.0, f"budget cap should stop near 16 frames, got {duration:.2f}s"
+
+    over = requests.post(
+        url,
+        json={
+            "model": omni_server.model,
+            "input": "Hello, this is Gepard speaking.",
+            "voice": "default",
+            "max_new_tokens": 4097,
+        },
+        timeout=DEFAULT_TIMEOUT_S,
+    )
+    assert over.status_code == 400
+    assert "max_new_tokens" in over.text
