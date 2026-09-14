@@ -397,15 +397,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._max_instructions_length = self._compute_max_instructions_length()
 
         self._tts_tokenizer = None
-        self._voxcpm2_tokenizer = None
         # Per-request output policy from the adapter's PreparedRequest. Keyed
         # by request_id so concurrent speech requests cannot overwrite each
         # other. Stored only for non-streaming requests and consumed (popped)
         # by the non-streaming accumulator in `_generate_audio_bytes`.
         self._speech_output_policies: dict[str, OutputPolicy] = {}
-        self._audex_tokenizer = None
-        self._audex_tta_rvq = None
-        self._voxcpm2_split_map: dict[int, list[int]] = {}
 
         # Batch configuration
         self._batch_max_items: int = getattr(self.engine_client, "tts_batch_max_items", 32)
@@ -2020,7 +2016,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
         """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
-        request_id, generator, _ = await self._prepare_speech_generation(request)
+        request_id, generator, tts_params = await self._prepare_speech_generation(request)
         try:
             async with aclosing(
                 self._generate_pcm_chunks(
@@ -2471,8 +2467,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     return error
 
                 media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
-                _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
-                return StreamingResponse(
+                _, generator, raw_tts_params = await self._prepare_speech_generation(
+                    request,
+                    request_id=request_id,
+                    arrival_time=request_arrival_ts,
+                )
+                return _SpeechStreamingResponse(
                     self._generate_audio_chunks(
                         generator,
                         request_id,
@@ -2494,8 +2494,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if error is not None:
                     return error
 
-                _, generator, sse_tts_params = await self._prepare_speech_generation(request, request_id=request_id)
-                return StreamingResponse(
+                _, generator, sse_tts_params = await self._prepare_speech_generation(
+                    request,
+                    request_id=request_id,
+                    arrival_time=request_arrival_ts,
+                )
+                return _SpeechStreamingResponse(
                     self._generate_audio_sse_events(
                         generator,
                         request_id,

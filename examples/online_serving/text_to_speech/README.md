@@ -143,6 +143,42 @@ python examples/online_serving/text_to_speech/gepard/speech_client.py \
 - Concurrent requests at `max_num_seqs: 4` are supported. Native-AR recompute preemption is a known limitation of this architecture (a request that is preempted mid-generation can resume incorrectly); keep concurrency at or below `max_num_seqs` and treat preemption as out of scope until the platform fix lands.
 - Optional comparison against the upstream Gepard reference server needs Blackwell/Hopper + CUDA 13 + Postgres and is not part of CI.
 
+## dots.tts
+
+Single-stage, text-only TTS at 48 kHz. The current integration supports
+no-reference synthesis; voice cloning, reference audio, named voices, and
+precomputed speaker embeddings are not supported yet.
+
+### Launch
+
+```bash
+vllm serve dots-studio/dots.tts-soar --omni --trust-remote-code --port 8091
+```
+
+### Sending requests
+
+```bash
+# Non-streaming WAV
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is a dots TTS online-serving test.",
+        "voice": "default",
+        "response_format": "wav"
+    }' --output output.wav
+
+# Streaming 48 kHz mono PCM
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is a streaming dots TTS test.",
+        "voice": "default",
+        "stream": true,
+        "stream_format": "audio",
+        "response_format": "pcm"
+    }' --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 1 -
+```
+
 ---
 
 ## GLM-TTS
@@ -265,6 +301,11 @@ python examples/online_serving/text_to_speech/indextts2/speech_client.py \
 0.6B DualAR TTS at 44.1 kHz, 11 languages, zero-shot voice cloning.
 
 ### Prerequisites
+
+None beyond the base install: the neural audio codec is implemented in tree and
+its weights (`codec.pth`) ship with the checkpoint.
+
+### Launch
 
 ```bash
 vllm serve Audio8/Audio8-TTS-Preview-0.6b --omni --port 8092
@@ -789,11 +830,16 @@ curl -X POST http://localhost:8091/v1/audio/voices \
     -F "speaker_description=warm narrator"
 ```
 
-Uploaded voices are then usable as `voice="custom_voice_1"` on subsequent requests.
+For Qwen3-TTS, uploaded voices are Base voice-cloning inputs and require a Base
+checkpoint. When a request names an uploaded voice, the server infers
+`task_type="Base"`. Built-in presets such as `vivian` and `ryan` remain
+CustomVoice speakers and require a CustomVoice checkpoint.
 
 ### Precomputed custom voices
 
-For reused Base voice-cloning speakers, precompute the reference artifacts once and load them at server startup:
+For reused Base voice-cloning speakers, precompute the reference artifacts once
+and load them at server startup. Precomputed voices use the same Base task and
+checkpoint-matching rules as uploaded voices:
 
 ```bash
 python qwen3_tts/precompute_custom_voice.py \
@@ -841,7 +887,7 @@ Raw PCM streaming requires `stream_format="audio"`, `response_format="pcm"`, and
 
 ### Streaming WebSocket
 
-The `/v1/audio/speech/stream` endpoint accepts text incrementally and synthesizes the buffered text as one continuous request on `input.done`:
+The `/v1/audio/speech/stream` endpoint accepts text incrementally and, by default, synthesizes the buffered text as one continuous request on `input.done`:
 
 ```bash
 python qwen3_tts/streaming_speech_client.py --text "Hello world. How are you? I am fine."
