@@ -143,6 +143,17 @@ def _build_moss_tts_request(adapter_cls, mocker, *, request_seed):
     )
 
 
+@pytest.mark.parametrize(
+    ("adapter_cls", "expect_accumulate"),
+    [(MossTTSAdapter, False), (MossTTSNanoAdapter, True)],
+)
+def test_moss_tts_accumulate_nonstreaming_follows_adapter_flag(adapter_cls, expect_accumulate, mocker):
+    prepared = _build_moss_tts_request(adapter_cls, mocker, request_seed=7)
+
+    assert adapter_cls.accumulate_nonstreaming is expect_accumulate
+    assert prepared.output_policy.accumulate_nonstreaming is expect_accumulate
+
+
 # Full-family coverage pins the adapter contract; only Nano consumes this seed end to end today.
 @pytest.mark.parametrize("adapter_cls", [MossTTSAdapter, MossTTSNanoAdapter])
 @pytest.mark.parametrize("request_seed", [0, 1234])
