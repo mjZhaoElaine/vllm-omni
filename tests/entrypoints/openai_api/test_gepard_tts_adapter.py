@@ -30,8 +30,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _MODEL = "nineninesix/gepard-1.0"
 
 
-def _adapter() -> GepardAdapter:
-    engine = SimpleNamespace(model_config=SimpleNamespace(model=_MODEL))
+def _adapter(*, revision: str | None = None) -> GepardAdapter:
+    engine = SimpleNamespace(model_config=SimpleNamespace(model=_MODEL, revision=revision))
     return GepardAdapter(SpeechServingContext(server=SimpleNamespace(engine_client=engine), engine_client=engine))
 
 
@@ -152,6 +152,32 @@ def test_gepard_build_matches_offline_prompt_builder(monkeypatch) -> None:
     assert prepared.output_policy.accumulate_nonstreaming is True
 
 
+def test_gepard_loads_tokenizer_and_config_at_served_revision(monkeypatch) -> None:
+    adapter = _adapter(revision="abc123")
+    seen: dict[str, object] = {}
+
+    def fake_from_checkpoint(model, backbone_config=None, revision=None):
+        seen["config"] = (model, revision)
+        return GepardConfig()
+
+    class _Tok:
+        def __init__(self, *args, **kwargs):
+            seen["tok"] = (args[0] if args else None, kwargs.get("revision"))
+
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [11, 12, 13]}
+
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.gepard.configuration_gepard.GepardConfig.from_checkpoint",
+        staticmethod(fake_from_checkpoint),
+    )
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", _Tok)
+    prepared = asyncio.run(adapter.build(OpenAICreateSpeechRequest(input="Hello from Gepard."), [], False))
+    assert seen["config"] == (_MODEL, "abc123")
+    assert seen["tok"] == (_MODEL, "abc123")
+    assert prepared.prompt["prompt_token_ids"] == build_gepard_prompt_ids([11, 12, 13], config=GepardConfig())
+
+
 def _gepard_mock_output(sample_rate: int = 22050, num_samples: int = 2048) -> OmniRequestOutput:
     class MockCompletionOutput:
         def __init__(self) -> None:
@@ -198,7 +224,7 @@ def gepard_server(mocker: MockerFixture):
 
     mock_engine_client = mocker.MagicMock()
     mock_engine_client.errored = False
-    mock_engine_client.model_config = mocker.MagicMock(model=_MODEL, async_chunk=False)
+    mock_engine_client.model_config = mocker.MagicMock(model=_MODEL, async_chunk=False, revision=None)
     mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=1000, seed=42, extra_args=None)]
     mock_engine_client.tts_batch_max_items = 32
     mock_engine_client.generate = mocker.MagicMock(side_effect=lambda **_k: _gen())

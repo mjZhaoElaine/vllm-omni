@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from vllm.utils.async_utils import make_async
+
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
@@ -55,6 +57,7 @@ class GepardAdapter(ARTTSAdapter):
         super().__init__(ctx)
         self._tokenizer: Any = None
         self._gepard_config: GepardConfig | None = None
+        self._build_prompt_async = make_async(self._build_prompt, executor=getattr(ctx.server, "_tts_executor", None))
 
     def _load_supported_speakers(self) -> set[str]:
         return {_DEFAULT_VOICE}
@@ -116,17 +119,8 @@ class GepardAdapter(ARTTSAdapter):
         sampling_params_list: list,
         has_inline_ref_audio: bool,
     ) -> PreparedRequest:
-        from vllm_omni.model_executor.models.gepard.prompt import build_gepard_prompt_ids
-
-        text = request.input
-        text_token_ids = self._tokenize(text)
-        prompt_token_ids = build_gepard_prompt_ids(text_token_ids, config=self._config())
-
         tts_params: dict = {}
-        prompt = {
-            "prompt_token_ids": prompt_token_ids,
-            "additional_information": {"text": [text]},
-        }
+        prompt = await self._build_prompt_async(request.input)
         prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
         return PreparedRequest(
             prompt=prompt,
@@ -135,19 +129,28 @@ class GepardAdapter(ARTTSAdapter):
             output_policy=OutputPolicy(accumulate_nonstreaming=True),
         )
 
-    def _checkpoint_id(self) -> str:
+    def _build_prompt(self, text: str) -> dict[str, Any]:
+        from vllm_omni.model_executor.models.gepard.prompt import build_gepard_prompt_ids
+
+        prompt_token_ids = build_gepard_prompt_ids(self._tokenize(text), config=self._config())
+        return {
+            "prompt_token_ids": prompt_token_ids,
+            "additional_information": {"text": [text]},
+        }
+
+    def _model_config(self) -> Any:
         engine = self.ctx.engine_client
-        if engine is None:
-            engine = getattr(self.ctx.server, "engine_client", None)
-        if engine is None:
-            raise RuntimeError("Gepard adapter has no engine_client")
-        return engine.model_config.model
+        assert engine is not None
+        return engine.model_config
 
     def _config(self) -> GepardConfig:
         if self._gepard_config is None:
             from vllm_omni.model_executor.models.gepard.configuration_gepard import GepardConfig
 
-            self._gepard_config = GepardConfig.from_checkpoint(self._checkpoint_id())
+            model_config = self._model_config()
+            self._gepard_config = GepardConfig.from_checkpoint(
+                model_config.model, revision=getattr(model_config, "revision", None)
+            )
         return self._gepard_config
 
     def _tokenize(self, text: str) -> list[int]:
@@ -155,6 +158,11 @@ class GepardAdapter(ARTTSAdapter):
         if tokenizer is None:
             from transformers import AutoTokenizer
 
-            tokenizer = AutoTokenizer.from_pretrained(self._checkpoint_id(), trust_remote_code=True)
+            model_config = self._model_config()
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_config.model,
+                revision=getattr(model_config, "revision", None),
+                trust_remote_code=True,
+            )
             self._tokenizer = tokenizer
         return tokenizer(text, add_special_tokens=False)["input_ids"]
