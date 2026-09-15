@@ -2062,9 +2062,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # the adapter asks for it — final_output alone may only carry the
             # last (often empty) sentinel. Prefer the engine's own concatenated
             # waveform when FINAL_ONLY already produced one.
-            accumulate_nonstreaming = (
-                getattr(self, "_speech_output_policies", {}).pop(request_id, OutputPolicy()).accumulate_nonstreaming
-            )
+            accumulate_nonstreaming = self._speech_output_policies.pop(
+                request_id, OutputPolicy()
+            ).accumulate_nonstreaming
             delta_chunks: list[Any] = []
             delta_sample_rate: int | None = None
 
