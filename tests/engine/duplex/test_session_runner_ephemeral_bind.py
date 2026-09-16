@@ -9,6 +9,9 @@ instead of the single resident ``...r.stage0`` id. These tests pin the id
 shape, the capability branching, the two-turn submit flow through the real
 session runner with a recording fake stage port, and the observe hook that
 lets an intermediate stage reach the client without stopping the pipeline.
+Silence continuation is refused on the non-resumable path, a finished
+observed intermediate stage does not close the stream, and a listen-only
+append keeps the turn-scoped Stage0 id bound.
 """
 
 from __future__ import annotations
@@ -255,6 +258,7 @@ class _FakeDataPlane(DuplexDataPlane):
 
     def __init__(self) -> None:
         self._terminal: set[str] = set()
+        self.closed_streams: list[str] = []
 
     def begin_request(self, request_id: str) -> None:
         self._terminal.discard(request_id)
@@ -266,7 +270,7 @@ class _FakeDataPlane(DuplexDataPlane):
         self._terminal.add(request_id)
 
     def close_stream(self, request_id: str) -> None:
-        return
+        self.closed_streams.append(request_id)
 
     def close_session(self, session_id: str, *, active_request_id: str | None = None) -> None:
         self._terminal.clear()
@@ -283,7 +287,13 @@ class _FakeDataPlane(DuplexDataPlane):
             request_id = getattr(output, "request_id", None)
             if not isinstance(request_id, str) or not request_id:
                 continue
-            finished = bool(getattr(output, "finished", False))
+            mm = getattr(output, "multimodal_output", None)
+            model_turn_id = mm.get("model_turn_id") if isinstance(mm, Mapping) else None
+            if model_turn_id is None:
+                model_turn_id = getattr(output, "duplex_turn_id", None)
+            # Stage ``finished`` is not the duplex turn ending; only an explicit
+            # ``end_of_turn`` (final-stage / model turn_eos) closes the response.
+            end_of_turn = bool(mm.get("end_of_turn")) if isinstance(mm, Mapping) else False
             events.append(
                 {
                     "stage_role": "tts",
@@ -291,8 +301,8 @@ class _FakeDataPlane(DuplexDataPlane):
                     "data_plane_request_id": request_id,
                     "audio": "wav-fake",
                     "sample_rate_hz": 24000,
-                    "model_turn_id": getattr(output, "duplex_turn_id", None),
-                    "end_of_turn": finished,
+                    "model_turn_id": model_turn_id,
+                    "end_of_turn": end_of_turn,
                 }
             )
         return events
@@ -575,14 +585,25 @@ def append_audio(samples: int = 16000) -> commands.AppendAudio:
     )
 
 
-def fake_output(request_id: str, *, finished: bool, turn_id: int | None = 0) -> SimpleNamespace:
-    """A final-stage output the way the orchestrator hands it to the runner."""
+def fake_output(
+    request_id: str,
+    *,
+    finished: bool,
+    turn_id: int | None = 0,
+    end_of_turn: bool = False,
+) -> SimpleNamespace:
+    """A stage output the way the orchestrator hands it to the runner."""
+    # ``model_turn_id`` must sit in multimodal_output to survive
+    # OmniRequestOutput.from_stage_output; a raw duplex_turn_id attribute does not.
+    multimodal_output: dict[str, object] = {"end_of_turn": end_of_turn}
+    if turn_id is not None:
+        multimodal_output["model_turn_id"] = turn_id
     return SimpleNamespace(
         request_id=request_id,
         finished=finished,
         duplex_turn_id=turn_id,
-        outputs=[SimpleNamespace(text="", token_ids=[], multimodal_output={})],
-        multimodal_output={},
+        outputs=[SimpleNamespace(text="", token_ids=[], multimodal_output=multimodal_output)],
+        multimodal_output=multimodal_output,
     )
 
 
@@ -617,7 +638,10 @@ async def test_ephemeral_two_committed_turns_get_fresh_stage0_ids() -> None:
         assert first.resumable is False
 
         # The model answers; the data plane reports model_turn_id so the turn completes.
-        events = await h.deliver_and_settle(fake_output(first.context.request_id, finished=True, turn_id=0), stage_id=1)
+        events = await h.deliver_and_settle(
+            fake_output(first.context.request_id, finished=True, turn_id=0, end_of_turn=True),
+            stage_id=1,
+        )
         assert "response.done" in types(events)
         assert h.session.turn_id == 1
 
@@ -648,7 +672,10 @@ async def test_ephemeral_rebind_after_turn_without_model_turn_id() -> None:
         assert first_id.endswith(".r.stage0_t0")
 
         # The response ends but the model turn is never completed (no id).
-        events = await h.deliver_and_settle(fake_output(first_id, finished=True, turn_id=None), stage_id=1)
+        events = await h.deliver_and_settle(
+            fake_output(first_id, finished=True, turn_id=None, end_of_turn=True),
+            stage_id=1,
+        )
         assert "response.done" in types(events)
         assert h.session.turn_id == 0
 
@@ -689,5 +716,73 @@ async def test_observe_stage0_projects_and_still_forwards() -> None:
         assert forwarded is False
         events = await h.settle()
         assert "response.output_audio.delta" not in types(events)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_observe_finished_intermediate_does_not_close_the_stream() -> None:
+    """A finished observed stage is that stage ending, not the duplex turn."""
+    h = await open_harness(observe_stage0=True)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        request_id = h.port.submissions[0].context.request_id
+
+        forwarded = h.deliver(fake_output(request_id, finished=True, turn_id=0), stage_id=0)
+        events = await h.settle()
+        assert forwarded is False
+        assert "response.output_audio.delta" in types(events)
+        assert "response.done" not in types(events)
+        assert h.plugin.data_plane.closed_streams == []
+        assert len(h.port.submissions) == 1
+        assert h.runner.model_state.continuation_units == 0
+        assert h.session.turn_id == 0
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_finished_final_stage_does_not_schedule_silence_continuation() -> None:
+    """Non-resumable stage0 cannot submit_update a silence unit after TTS ends."""
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        request_id = h.port.submissions[0].context.request_id
+
+        events = await h.deliver_and_settle(
+            fake_output(request_id, finished=True, turn_id=0, end_of_turn=True),
+            stage_id=1,
+        )
+        assert "response.done" in types(events)
+        assert request_id in h.plugin.data_plane.closed_streams
+        assert len(h.port.submissions) == 1
+        assert h.runner.model_state.continuation_units == 0
+        assert h.runner.model_state.continuation_owner_id is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_listen_only_append_keeps_ephemeral_stage0_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Turn-scoped ids must survive a listen-only append; only ``...r.stage0`` is cleared."""
+    h = await open_harness()
+    try:
+
+        async def listen_only(*args: object, **kwargs: object) -> tuple[bool, bool]:
+            del args, kwargs
+            return True, False
+
+        monkeypatch.setattr(h.runner.model, "append_runtime_input", listen_only)
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        bound = h.session.active_request_id
+        assert isinstance(bound, str)
+        assert bound.endswith(".r.stage0_t0")
+        assert not bound.endswith(".r.stage0")
+        assert h.port.submissions == []
     finally:
         await close_harness(h)
