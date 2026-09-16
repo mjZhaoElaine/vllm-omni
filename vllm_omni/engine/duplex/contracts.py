@@ -78,6 +78,12 @@ class DuplexStageSubmission:
     context: DuplexStageRequestContext
     prompt: Mapping[str, object]
     already_submitted: bool
+    #: True: resume/update an existing stage0 id. False: open a new ephemeral
+    #: (turn-scoped) request. Distinct from
+    #: ``DuplexCapabilities.supports_core_resumable_request``, which selects
+    #: the request-id shape; this flag tells the stage port which submit
+    #: semantics the id carries.
+    resumable: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", MappingProxyType(dict(self.prompt)))
@@ -157,6 +163,16 @@ def duplex_resource_request_id(fence: DuplexFence, role: str) -> str:
     return f"duplex-s.{encoded_session_id}.e.{fence.epoch}.r.{role}"
 
 
+def duplex_ephemeral_stage_request_id(fence: DuplexFence, *, stage_id: int) -> str:
+    """Turn-scoped stage request id for non-resumable (ephemeral) duplex models.
+
+    A model whose Stage0 cannot resume appends on a finished request gets one
+    ordinary request per committed turn instead of the single resident
+    ``...r.stage0`` id.
+    """
+    return duplex_resource_request_id(fence, f"stage{stage_id}_t{fence.turn_id}")
+
+
 def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
     """Return whether a current-format resource request belongs to a session."""
     parts = request_id.split(".")
@@ -187,6 +203,7 @@ __all__ = [
     "DuplexStageSubmission",
     "DuplexStageSubmissionResult",
     "duplex_data_plane_request_info",
+    "duplex_ephemeral_stage_request_id",
     "duplex_resource_request_belongs_to_session",
     "duplex_resource_request_id",
 ]
