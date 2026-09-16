@@ -173,6 +173,15 @@ def duplex_ephemeral_stage_request_id(fence: DuplexFence, *, stage_id: int) -> s
     return duplex_resource_request_id(fence, f"stage{stage_id}_t{fence.turn_id}")
 
 
+def is_stable_stage0_placeholder(request_id: str, *, session_id: str, epoch: int) -> bool:
+    """Return whether ``request_id`` is the resident ``...r.stage0`` placeholder.
+
+    Turn-scoped ephemeral ids (``...r.stage0_t{N}``) use a different role and
+    do not match.
+    """
+    return request_id == duplex_resource_request_id(DuplexFence(session_id, epoch=epoch), "stage0")
+
+
 def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
     """Return whether a current-format resource request belongs to a session."""
     parts = request_id.split(".")
@@ -206,4 +215,5 @@ __all__ = [
     "duplex_ephemeral_stage_request_id",
     "duplex_resource_request_belongs_to_session",
     "duplex_resource_request_id",
+    "is_stable_stage0_placeholder",
 ]

@@ -214,24 +214,23 @@ class ModelChannel:
             # Ephemeral turn-commit cannot submit_update on a finished stage0
             # id: this turn never completed (e.g. a listen-only turn), so its
             # id is still bound. Complete the turn to advance turn_id, mint a
-            # fresh ephemeral id, and abort the stale request so no stage is
-            # left orphaned.
+            # fresh ephemeral id, and abort only that stale Stage0 request.
+            # Downstream stage bindings are left alone — they are created by
+            # orchestrator forward, not by this Stage0 append path.
             stale_ephemeral_id = request_id
-            stale_ids = list(dict.fromkeys(rid for _, rid in session.request_resources.keys()))
             session.complete_model_turn(fence.turn_id)
             fence = DuplexFence(session.session_id, epoch=session.epoch, turn_id=session.turn_id)
             request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=False)
             session.request_resources.pop((stage_id, stale_ephemeral_id), None)
-            if stale_ids:
-                try:
-                    await self._ctx.stage_port.cleanup(stale_ids, abort=True)
-                except Exception:
-                    logger.warning(
-                        "duplex abort of stale ephemeral request failed session=%s ids=%s",
-                        session.session_id,
-                        stale_ids,
-                        exc_info=True,
-                    )
+            try:
+                await self._ctx.stage_port.cleanup([stale_ephemeral_id], abort=True)
+            except Exception:
+                logger.warning(
+                    "duplex abort of stale ephemeral request failed session=%s id=%s",
+                    session.session_id,
+                    stale_ephemeral_id,
+                    exc_info=True,
+                )
         try:
             session.begin_lease_operation(fence, lease_operation_id)
             operation_started = True

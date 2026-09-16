@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import DuplexSessionState, DuplexTurnEventType
+from vllm_omni.engine.duplex.contracts import is_stable_stage0_placeholder
 from vllm_omni.engine.duplex.plugin import PcmAppendReservation
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
@@ -154,11 +155,13 @@ class AppendAttempt:
                 self.ctx.run.runtime_closed = True
                 return False
             if not emitted_response and session.epoch == self.epoch:
-                # Only clear the stable stage0 placeholder (...r.stage0).
-                # Turn-scoped ephemeral ids (...r.stage0_tN) stay bound after
-                # a listen-only append; the next commit re-binds them.
+                # Only clear the resident ...r.stage0 placeholder. Turn-scoped
+                # ephemeral ids (...r.stage0_tN) stay bound after a listen-only
+                # append; the next commit re-binds them.
                 active = session.active_request_id
-                if isinstance(active, str) and active.endswith(".r.stage0"):
+                if isinstance(active, str) and is_stable_stage0_placeholder(
+                    active, session_id=session.session_id, epoch=self.epoch
+                ):
                     session.clear_request(active)
                 if self.final:
                     self.out.emit_events([session.signal_turn(DuplexTurnEventType.USER_STARTED.value)])

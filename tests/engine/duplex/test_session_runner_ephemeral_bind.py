@@ -10,8 +10,9 @@ shape, the capability branching, the two-turn submit flow through the real
 session runner with a recording fake stage port, and the observe hook that
 lets an intermediate stage reach the client without stopping the pipeline.
 Silence continuation is refused on the non-resumable path, a finished
-observed intermediate stage does not close the stream, and a listen-only
-append keeps the turn-scoped Stage0 id bound.
+observed intermediate stage does not close the stream, a listen-only
+append keeps the turn-scoped Stage0 id bound, and a later commit re-binds
+a stale submitted id without aborting leftover downstream bindings.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageSubmissionResult,
     duplex_ephemeral_stage_request_id,
     duplex_resource_request_id,
+    is_stable_stage0_placeholder,
 )
 from vllm_omni.engine.duplex.events import DuplexEvent
 from vllm_omni.engine.duplex.messages import (
@@ -78,14 +80,24 @@ def test_stage_request_id_ephemeral_when_not_resumable() -> None:
     request_id = DuplexSessionManager.stage_request_id(fence, stage_id=0, resumable=False)
     assert request_id == duplex_ephemeral_stage_request_id(fence, stage_id=0)
     assert request_id.endswith(".r.stage0_t3")
-    assert not request_id.endswith(".r.stage0")
+    assert not is_stable_stage0_placeholder(request_id, session_id=SESSION_ID, epoch=0)
 
 
 def test_stage_request_id_resumable_keeps_stable_role() -> None:
     fence = DuplexFence(SESSION_ID, epoch=1, turn_id=3)
     request_id = DuplexSessionManager.stage_request_id(fence, stage_id=0, resumable=True)
     assert request_id == duplex_resource_request_id(fence, "stage0")
-    assert request_id.endswith(".r.stage0")
+    assert is_stable_stage0_placeholder(request_id, session_id=SESSION_ID, epoch=1)
+
+
+def test_is_stable_stage0_placeholder_rejects_ephemeral_ids() -> None:
+    fence = DuplexFence(SESSION_ID, epoch=0, turn_id=3)
+    assert is_stable_stage0_placeholder(duplex_resource_request_id(fence, "stage0"), session_id=SESSION_ID, epoch=0)
+    assert not is_stable_stage0_placeholder(
+        duplex_ephemeral_stage_request_id(fence, stage_id=0),
+        session_id=SESSION_ID,
+        epoch=0,
+    )
 
 
 def test_stage_submission_resumable_defaults_to_true() -> None:
@@ -108,13 +120,16 @@ def test_helpers_stage0_request_id_branches_on_capability() -> None:
         turn_id=2,
         capabilities=DuplexCapabilities(supports_core_resumable_request=False),
     )
-    assert stage0_request_id(ephemeral_session, 0).endswith(".r.stage0_t2")
+    ephemeral_id = stage0_request_id(ephemeral_session, 0)
+    assert ephemeral_id.endswith(".r.stage0_t2")
+    assert not is_stable_stage0_placeholder(ephemeral_id, session_id=SESSION_ID, epoch=0)
     resident_session = SimpleNamespace(
         session_id=SESSION_ID,
         turn_id=2,
         capabilities=DuplexCapabilities(supports_core_resumable_request=True),
     )
-    assert stage0_request_id(resident_session, 0).endswith(".r.stage0")
+    resident_id = stage0_request_id(resident_session, 0)
+    assert is_stable_stage0_placeholder(resident_id, session_id=SESSION_ID, epoch=0)
 
 
 def test_observe_stage_output_defaults_off() -> None:
@@ -679,9 +694,12 @@ async def test_ephemeral_rebind_after_turn_without_model_turn_id() -> None:
         assert "response.done" in types(events)
         assert h.session.turn_id == 0
 
+        leftover_stage1 = duplex_resource_request_id(h.session.fence, "stage1")
+        h.session.bind_stage_request(1, leftover_stage1, fence=h.session.fence)
+
         # The next commit cannot reuse the finished t0 id: the turn is
-        # completed mechanically, a fresh t1 id is minted, and the stale
-        # request is aborted so no stage is left orphaned.
+        # completed mechanically, a fresh t1 id is minted, and only the stale
+        # Stage0 request is aborted. A leftover downstream binding stays.
         await h.run(append_audio())
         await h.run(commands.Commit(create_response=True))
         assert len(h.port.submissions) == 2
@@ -690,6 +708,56 @@ async def test_ephemeral_rebind_after_turn_without_model_turn_id() -> None:
         assert second.already_submitted is False
         assert h.session.turn_id == 1
         assert h.port.cleanups == [([first_id], True)]
+        assert leftover_stage1 not in {rid for ids, _abort in h.port.cleanups for rid in ids}
+        assert (1, leftover_stage1) in h.session.request_resources
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_listen_only_submit_rebinds_on_the_next_commit() -> None:
+    """A real listen-only Stage0 submit stays bound; the next commit re-binds it."""
+    h = await open_harness()
+    try:
+        payload = {
+            "type": "audio",
+            "audio": base64.b64encode(pcm_f32(16000)).decode("ascii"),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "final": True,
+            "is_speech": True,
+        }
+        task = await h.runner._start_append(payload, final=True, precreate_response=False)
+        assert await task is True
+        await h.settle()
+
+        assert len(h.port.submissions) == 1
+        first = h.port.submissions[0]
+        first_id = first.context.request_id
+        assert first_id.endswith(".r.stage0_t0")
+        assert first.already_submitted is False
+        assert first.resumable is False
+        assert h.session.active_request_id == first_id
+        assert not is_stable_stage0_placeholder(first_id, session_id=SESSION_ID, epoch=0)
+        assert h.session.turn_id == 0
+        assert h.session.active_response_id is None
+        assert "response.created" not in types(h.events)
+
+        leftover_stage1 = duplex_resource_request_id(h.session.fence, "stage1")
+        h.session.bind_stage_request(1, leftover_stage1, fence=h.session.fence)
+
+        await h.run(append_audio())
+        events = await h.run(commands.Commit(create_response=True))
+        assert "input_audio_buffer.committed" in types(events)
+        assert "response.created" in types(events)
+        assert len(h.port.submissions) == 2
+        second = h.port.submissions[1]
+        assert second.context.request_id.endswith(".r.stage0_t1")
+        assert second.already_submitted is False
+        assert h.session.turn_id == 1
+        assert h.port.cleanups == [([first_id], True)]
+        assert leftover_stage1 not in {rid for ids, _abort in h.port.cleanups for rid in ids}
+        assert (1, leftover_stage1) in h.session.request_resources
     finally:
         await close_harness(h)
 
@@ -782,7 +850,7 @@ async def test_listen_only_append_keeps_ephemeral_stage0_bound(
         bound = h.session.active_request_id
         assert isinstance(bound, str)
         assert bound.endswith(".r.stage0_t0")
-        assert not bound.endswith(".r.stage0")
+        assert not is_stable_stage0_placeholder(bound, session_id=SESSION_ID, epoch=0)
         assert h.port.submissions == []
     finally:
         await close_harness(h)
