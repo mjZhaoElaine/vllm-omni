@@ -84,10 +84,10 @@ QWEN3_OMNI_MOE_DUPLEX_PLUGIN = (
     "vllm_omni.model_executor.models.qwen3_omni.duplex.moe_plugin.Qwen3OmniDuplexPlugin"
 )
 
-# Opt-in turn-commit duplex: same Thinker→Talker→Code2Wav topology as the
-# stock pipeline. Selected via ``pipeline: qwen3_omni_moe_duplex`` plus
-# ``session_mode: duplex``. The stock ``qwen3_omni_moe`` plugin (engine-owned
-# VAD / ``qwen3_omni_duplex.yaml``) stays on ``duplex.plugin``.
+# Turn-commit duplex: same Thinker→Talker→Code2Wav topology. Select with
+# ``pipeline: qwen3_omni_moe_duplex`` and ``session_mode: duplex``. The
+# stock ``qwen3_omni_moe`` plugin (engine-owned VAD /
+# ``qwen3_omni_duplex.yaml``) stays on ``duplex.plugin``.
 QWEN3_OMNI_DUPLEX_PIPELINE = replace(
     QWEN3_OMNI_PIPELINE,
     model_type="qwen3_omni_moe_duplex",

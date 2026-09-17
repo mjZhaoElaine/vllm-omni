@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Model-agnostic ephemeral turn-commit helpers (Qwen3-local for now).
+"""Model-agnostic ephemeral turn-commit helpers.
 
-Kept free of qwen3-specific imports so a later shared toolbox extraction is a
-lift-and-shift. The buffer accumulates PCM and emits one utterance on commit;
-the session state is the runner-owned per-session bag the plugin contract
-requires.
+The buffer accumulates PCM and emits one utterance on commit. Session
+state is the runner-owned per-session bag the plugin contract requires.
 """
 
 from __future__ import annotations

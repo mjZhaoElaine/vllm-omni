@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Activation variant: pipeline registry, stock isolation, startup matrix."""
+"""Activation variant: pipeline registry and startup matrix."""
 
 from __future__ import annotations
 

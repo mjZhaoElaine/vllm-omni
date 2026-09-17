@@ -4,7 +4,7 @@
 """Project Qwen3-Omni stage outputs into duplex internal events.
 
 Stage 0 (Thinker) surfaces text via ``observe_stage_output``. Stage 2
-(Code2Wav) surfaces PCM. Stage 1 (Talker) is forwarded, not projected.
+(Code2Wav) surfaces PCM. Stage 1 (Talker) is forwarded to the next stage.
 """
 
 from __future__ import annotations
@@ -79,7 +79,7 @@ def _multimodal(output: object, completion: object | None) -> dict[str, object]:
 
 
 def _audio_payload(metadata: Mapping[str, object]) -> object | None:
-    """Code2Wav PCM only. Talker ``latent`` must not become a TTS event."""
+    """Code2Wav PCM under the ``audio`` key."""
     return metadata.get("audio")
 
 
@@ -113,7 +113,7 @@ def _slice_cumulative_audio(audio: object, offset: int) -> object | None:
 
 
 def _iter_new_audio(audio: object, state: _RequestState) -> Iterator[object]:
-    """Yield only samples/chunks not yet encoded for this request."""
+    """Yield newly arrived samples or chunks for this request."""
     if isinstance(audio, list):
         new_chunks = audio[state.chunks_drained :]
         state.chunks_drained = len(audio)

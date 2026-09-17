@@ -7,7 +7,7 @@ from vllm_omni.engine.duplex.config import DuplexCapabilities
 
 
 def qwen3_omni_duplex_capabilities(*, max_sessions: int = 1) -> DuplexCapabilities:
-    """Qwen3-Omni turn-commit duplex capabilities (not MiniCPM resident append)."""
+    """Qwen3-Omni turn-commit duplex capabilities."""
     supports_multi_session = max_sessions > 1
     return DuplexCapabilities(
         supports_model_native_turn_policy=False,
