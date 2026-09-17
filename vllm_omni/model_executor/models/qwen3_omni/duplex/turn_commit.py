@@ -118,15 +118,14 @@ class TurnCommitPcmAppendBuffer(PcmAppendBuffer):
         sample_rate_hz = payload.get("sample_rate_hz")
         audio = payload.get("audio")
         if fmt != "pcm_f32le" or not isinstance(sample_rate_hz, int) or not isinstance(audio, str):
-            self._had_speech = self._had_speech or bool(payload.get("is_speech", False))
-            return None
+            raise ValueError(f"{self._label} append requires pcm_f32le audio and sample_rate_hz")
 
         try:
             raw = base64.b64decode(audio, validate=True)
-        except (binascii.Error, ValueError):
-            return None
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(f"{self._label} audio is not valid base64") from exc
         if len(raw) % _SAMPLE_BYTES:
-            return None
+            raise ValueError(f"{self._label} pcm_f32le payload has a partial sample")
 
         if self._sample_rate_hz is not None and self._sample_rate_hz != sample_rate_hz:
             raise ValueError(f"{self._label} audio append sample_rate_hz changed within a session")

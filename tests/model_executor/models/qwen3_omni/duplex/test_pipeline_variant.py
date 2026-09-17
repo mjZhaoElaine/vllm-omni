@@ -38,9 +38,11 @@ def test_duplex_variant_shares_stock_topology() -> None:
 def test_registry_resolves_duplex_variant_without_touching_stock() -> None:
     assert "qwen3_omni_moe_duplex" in OMNI_PIPELINES
     duplex = resolve_pipeline_config("qwen3_omni_moe_duplex")
-    stock = resolve_pipeline_config("qwen3_omni_moe_thinker_only")
+    thinker_only = resolve_pipeline_config("qwen3_omni_moe_thinker_only")
     assert duplex is QWEN3_OMNI_DUPLEX_PIPELINE
-    assert stock is OMNI_PIPELINES["qwen3_omni_moe_thinker_only"]
+    assert QWEN3_OMNI_PIPELINE.duplex_plugin is None
+    assert QWEN3_OMNI_PIPELINE is not duplex
+    assert thinker_only is OMNI_PIPELINES["qwen3_omni_moe_thinker_only"]
 
 
 def test_duplex_deploy_yaml_opts_into_variant() -> None:
@@ -68,6 +70,21 @@ def test_duplex_engine_rejects_turn_session_mode() -> None:
 
 def test_stock_and_moe_duplex_plugins_are_distinct() -> None:
     assert QWEN3_OMNI_PIPELINE.duplex_plugin != QWEN3_OMNI_DUPLEX_PIPELINE.duplex_plugin
+
+
+def test_duplex_engine_loads_plugin_when_session_mode_is_duplex() -> None:
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
+
+    stub = SimpleNamespace(
+        model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        pipeline_config=QWEN3_OMNI_DUPLEX_PIPELINE,
+        deploy_config=SimpleNamespace(session_mode="duplex", duplex_session=None),
+        _audio_encoder=lambda *args, **kwargs: None,
+        plugin=None,
+        duplex_session_config=None,
+    )
+    DuplexOmniEngine._validate_deployment(stub)
+    assert isinstance(stub.plugin, Qwen3OmniDuplexPlugin)
 
 
 def test_duplex_deploy_config_selects_variant_pipeline() -> None:

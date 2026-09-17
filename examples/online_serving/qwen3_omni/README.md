@@ -64,6 +64,8 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
 The YAML sets `pipeline: qwen3_omni_moe_duplex` and `session_mode: duplex`.
 Omitting `session_mode: duplex` on the variant fails startup with a clear
 error. Existing `session_mode: turn` Qwen3-Omni deployments are unchanged.
+Use Instruct weights; a Captioner/Thinking checkpoint plus this YAML would
+still try the three-stage duplex plugin.
 
 For a 3x-GPU multi-replica layout (talker/code2wav scale-out on cuda:1,2),
 use `--stage-overrides` on top of the default config:
@@ -346,6 +348,23 @@ pointing to your local artifact. See the [complete duplex setup](../realtime_web
 The default `qwen3_omni_moe.yaml` remains a turn deployment. Duplex mode serves
 `/v1/realtime?duplex=1` and `/v1/chat/completions`; the legacy STT handler requires
 a turn deployment.
+
+For the opt-in turn-commit plugin, use the bundled
+`vllm_omni/deploy/qwen3_omni_moe_duplex.yaml`. It already sets
+`pipeline: qwen3_omni_moe_duplex` and `session_mode: duplex`.
+Optionally add `duplex_session.server_vad_model_path` on a copy of **that**
+file — not on the stock turn-based `qwen3_omni_moe.yaml`.
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --omni \
+  --port 8091 \
+  --deploy-config vllm_omni/deploy/qwen3_omni_moe_duplex.yaml
+```
+
+Bare `/v1/realtime` selects the duplex handler. The client uses `?duplex=0`
+only for the existing non-Server-VAD wire flow; `?duplex=1` remains a
+supported compatibility alias.
 
 The Python client supports the following command-line arguments:
 
