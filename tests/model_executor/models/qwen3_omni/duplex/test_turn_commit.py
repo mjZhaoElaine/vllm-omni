@@ -46,6 +46,23 @@ def test_commit_only_buffer_emits_on_commit() -> None:
     assert not buf.has_pending()
 
 
+def test_commit_only_buffer_rejects_sample_rate_change() -> None:
+    buf = Qwen3OmniPcmAppendBuffer()
+    buf.prepare_append(_payload(), operation_id="op1", chunk_period_ms=1000, allow_emit=True)
+    changed = _payload()
+    changed["sample_rate_hz"] = 24000
+    with pytest.raises(ValueError, match="sample_rate_hz changed"):
+        buf.prepare_append(changed, operation_id="op2", chunk_period_ms=1000, allow_emit=True)
+
+
+def test_empty_prepare_commit_returns_no_payload() -> None:
+    buf = Qwen3OmniPcmAppendBuffer()
+    commit = buf.prepare_commit(operation_id="c0", chunk_period_ms=1000)
+    assert commit.payload is None
+    commit.commit()
+    assert not buf.has_pending()
+
+
 def test_generic_turn_commit_buffer_has_no_qwen3_imports() -> None:
     import inspect
 

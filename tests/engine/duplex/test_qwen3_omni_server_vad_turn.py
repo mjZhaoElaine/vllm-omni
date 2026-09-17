@@ -210,7 +210,7 @@ def fake_code2wav(request_id: str) -> SimpleNamespace:
     )
 
 
-async def open_harness(scores: Sequence[float]) -> Harness:
+async def open_harness(scores: Sequence[float] | None = None, *, server_vad: bool = True) -> Harness:
     plugin = Qwen3OmniDuplexPlugin(_encode_audio)
     port = RecordingStagePort(stage_count=3)
     output: asyncio.Queue[Any] = asyncio.Queue()
@@ -223,23 +223,24 @@ async def open_harness(scores: Sequence[float]) -> Harness:
         runtime_config=DuplexSessionRuntimeConfig(),
         model_config=None,
     )
-    manager.vad_backend_provider = ScriptedBackendProvider(ScriptedSpeechBackend(scores))
-    config = DuplexSessionConfig.from_realtime(
-        {
-            "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            "modalities": ["text", "audio"],
-            "instructions": "You are a concise assistant.",
-            "turn_detection": {
-                "type": "server_vad",
-                "threshold": 0.5,
-                "prefix_padding_ms": 0,
-                "silence_duration_ms": 100,
-                "min_speech_duration_ms": 32,
-                "create_response": True,
-                "interrupt_response": True,
-            },
+    if scores is not None:
+        manager.vad_backend_provider = ScriptedBackendProvider(ScriptedSpeechBackend(scores))
+    payload: dict[str, object] = {
+        "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        "modalities": ["text", "audio"],
+        "instructions": "You are a concise assistant.",
+    }
+    if server_vad:
+        payload["turn_detection"] = {
+            "type": "server_vad",
+            "threshold": 0.5,
+            "prefix_padding_ms": 0,
+            "silence_duration_ms": 100,
+            "min_speech_duration_ms": 32,
+            "create_response": True,
+            "interrupt_response": True,
         }
-    )
+    config = DuplexSessionConfig.from_realtime(payload)
     await manager.handle(OpenDuplexSessionMessage(control_id="c-open", session_id=SESSION_ID, session_config=config))
     result = await asyncio.wait_for(results.get(), timeout=2.0)
     assert isinstance(result, DuplexControlResultMessage) and result.ok, result
@@ -294,5 +295,59 @@ async def test_server_vad_turn_submits_one_ephemeral_qwen3_request() -> None:
         event_types = types(h.events)
         assert "response.output_audio.delta" in event_types
         assert "response.done" in event_types
+    finally:
+        await h.manager.shutdown()
+
+
+def _one_utterance_scores() -> list[float]:
+    return [0.0, 0.9, 0.9, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+
+@pytest.mark.asyncio
+async def test_server_vad_second_turn_rebinds_ephemeral_stage0() -> None:
+    scores = _one_utterance_scores() + _one_utterance_scores()
+    h = await open_harness(scores)
+    try:
+        await h.run(commands.AppendAudio(audio=pcm_f32(FRAME_SAMPLES * 10), format="pcm_f32le", sample_rate_hz=16000))
+        assert len(h.port.submissions) == 1
+        first = h.port.submissions[0]
+        assert first.context.request_id.endswith(".r.stage0_t0")
+        await h.deliver_and_settle(fake_thinker(first.context.request_id, "first"), stage_id=0)
+        await h.deliver_and_settle(fake_code2wav(first.context.request_id), stage_id=2)
+        assert "response.done" in types(h.events)
+        assert h.runner.session.turn_id == 1
+
+        await h.run(commands.AppendAudio(audio=pcm_f32(FRAME_SAMPLES * 10), format="pcm_f32le", sample_rate_hz=16000))
+        assert len(h.port.submissions) == 2
+        second = h.port.submissions[1]
+        assert second.context.request_id.endswith(".r.stage0_t1")
+        assert second.context.request_id != first.context.request_id
+        assert second.already_submitted is False
+        assert second.resumable is False
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_client_commit_submits_one_ephemeral_request() -> None:
+    h = await open_harness(server_vad=False)
+    try:
+        await h.run(
+            commands.AppendAudio(
+                audio=pcm_f32(FRAME_SAMPLES * 4),
+                format="pcm_f32le",
+                sample_rate_hz=16000,
+                is_speech=True,
+            )
+        )
+        assert h.port.submissions == []
+        events = await h.run(commands.Commit(create_response=True, is_speech=True))
+        assert "input_audio_buffer.committed" in types(events)
+        assert "response.created" in types(events)
+        assert len(h.port.submissions) == 1
+        submission = h.port.submissions[0]
+        assert submission.context.request_id.endswith(".r.stage0_t0")
+        assert submission.already_submitted is False
+        assert submission.resumable is False
     finally:
         await h.manager.shutdown()

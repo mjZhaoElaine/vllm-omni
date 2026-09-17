@@ -115,21 +115,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     ) -> DuplexAppendPlan:
         del request_id, session_config, seq, turn_seq, sampling_params
 
-        def _skip() -> DuplexAppendPlan:
-            return DuplexAppendPlan(
-                prompt={
-                    "prompt_token_ids": [0],
-                    "additional_information": {
-                        "qwen3_skip_submit": True,
-                        "session_id": fence.session_id,
-                        "epoch": fence.epoch,
-                        "turn_id": fence.turn_id,
-                    },
-                }
-            )
-
         if not final:
-            return _skip()
+            raise ValueError("Qwen3-Omni duplex plan_append only accepts a committed final turn")
         if not isinstance(payload, Mapping):
             raise ValueError("Qwen3-Omni duplex plan_append expects a mapping payload")
 
@@ -225,7 +212,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if config.instructions:
             updated["instructions"] = config.instructions
             updated.setdefault("qwen3_system_prompt", config.instructions)
-        if isinstance(config.initial_user_text, str) and config.initial_user_text:
+        extra_user_text = extra.get("duplex_initial_user_text")
+        if isinstance(extra_user_text, str) and extra_user_text:
+            updated["initial_user_text"] = extra_user_text
+        elif isinstance(config.initial_user_text, str) and config.initial_user_text:
             updated["initial_user_text"] = config.initial_user_text
         return updated
 

@@ -53,6 +53,8 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
 The YAML sets `pipeline: qwen3_omni_moe_duplex` and `session_mode: duplex`.
 Omitting `session_mode: duplex` on the variant fails startup with a clear
 error. Existing `session_mode: turn` Qwen3-Omni deployments are unchanged.
+Use Instruct weights; a Captioner/Thinking checkpoint plus this YAML would
+still try the three-stage duplex plugin.
 
 For a 3x-GPU multi-replica layout (talker/code2wav scale-out on cuda:1,2),
 use `--stage-overrides` on top of the default config:
@@ -328,20 +330,23 @@ duplex_session:
   server_vad_model_path: /models/silero_vad.onnx
 ```
 
-Start from the bundled Qwen3-Omni deployment YAML, add the fields above at the top level, and serve that complete configuration:
+Use the bundled duplex deploy YAML (`vllm_omni/deploy/qwen3_omni_moe_duplex.yaml`).
+It already sets `pipeline: qwen3_omni_moe_duplex` and `session_mode: duplex`.
+Optionally add `duplex_session.server_vad_model_path` on a copy of **that**
+file — not on the stock turn-based `qwen3_omni_moe.yaml`. Combining
+`session_mode: turn` with a `duplex_session:` block is the pre-#7413 recipe
+and is no longer consumed.
 
 ```bash
-cp vllm_omni/deploy/qwen3_omni_moe.yaml /path/to/qwen3_omni_server_vad.yaml
-# Edit /path/to/qwen3_omni_server_vad.yaml and add duplex_session.
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --omni \
   --port 8091 \
-  --deploy-config /path/to/qwen3_omni_server_vad.yaml
+  --deploy-config vllm_omni/deploy/qwen3_omni_moe_duplex.yaml
 ```
 
-Keep Qwen's default `session_mode: turn`; `duplex_session` enables the Realtime handler without changing scheduler
-semantics. Bare `/v1/realtime` selects that handler. The client uses `?duplex=0` only for the existing non-Server-VAD
-wire flow; `?duplex=1` remains a supported compatibility alias.
+Bare `/v1/realtime` selects the duplex handler. The client uses `?duplex=0`
+only for the existing non-Server-VAD wire flow; `?duplex=1` remains a
+supported compatibility alias.
 
 The Python client supports the following command-line arguments:
 

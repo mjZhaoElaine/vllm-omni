@@ -18,7 +18,6 @@ from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, EncodeAudio
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
-_THINKER_STAGE_ID = 0
 _CODE2WAV_STAGE_ID = 2
 _DEFAULT_SAMPLE_RATE_HZ = 24000
 
@@ -37,6 +36,7 @@ class Qwen3OmniDataPlaneContext:
 class _RequestState:
     text_sent: str = ""
     audio_offset: int = 0
+    chunks_drained: int = 0
     terminal: bool = False
     stage_seen: set[int] = field(default_factory=set)
 
@@ -78,14 +78,55 @@ def _multimodal(output: object, completion: object | None) -> dict[str, object]:
     return {}
 
 
-def _audio_value(metadata: Mapping[str, object]) -> object | None:
-    value = next(
-        (metadata[key] for key in ("audio", "model_outputs", "latent") if key in metadata),
-        None,
-    )
-    if isinstance(value, list) and len(value) == 1:
-        return value[0]
-    return value
+def _audio_payload(metadata: Mapping[str, object]) -> object | None:
+    """Code2Wav PCM only. Talker ``latent`` must not become a TTS event."""
+    return metadata.get("audio")
+
+
+def _context_response_format(context: object | None) -> str:
+    value = getattr(context, "response_format", None) if context is not None else None
+    return value if isinstance(value, str) and value else "wav"
+
+
+def _context_speed(context: object | None) -> float | None:
+    value = getattr(context, "speed", None) if context is not None else None
+    return float(value) if isinstance(value, int | float) else None
+
+
+def _slice_cumulative_audio(audio: object, offset: int) -> object | None:
+    samples = _audio_num_samples(audio)
+    if samples <= 0 or samples <= offset:
+        return None
+    if offset <= 0:
+        return audio
+    try:
+        import torch
+
+        if isinstance(audio, torch.Tensor):
+            return audio.reshape(-1)[offset:].contiguous()
+    except Exception:
+        pass
+    try:
+        return np.asarray(audio, dtype=np.float32).reshape(-1)[offset:]
+    except (TypeError, ValueError):
+        return None
+
+
+def _iter_new_audio(audio: object, state: _RequestState) -> Iterator[object]:
+    """Yield only samples/chunks not yet encoded for this request."""
+    if isinstance(audio, list):
+        new_chunks = audio[state.chunks_drained :]
+        state.chunks_drained = len(audio)
+        for chunk in new_chunks:
+            if chunk is not None:
+                yield chunk
+        return
+    sliced = _slice_cumulative_audio(audio, state.audio_offset)
+    total = _audio_num_samples(audio)
+    if total > state.audio_offset:
+        state.audio_offset = total
+    if sliced is not None:
+        yield sliced
 
 
 def _sample_rate(metadata: Mapping[str, object]) -> int:
@@ -135,6 +176,7 @@ class Qwen3OmniDataPlaneSession(DuplexDataPlane):
         state = self._requests.get(request_id)
         if state is not None:
             state.audio_offset = 0
+            state.chunks_drained = 0
 
     def close_session(self, session_id: str, *, active_request_id: str | None = None) -> None:
         if active_request_id is not None:
@@ -182,19 +224,26 @@ class Qwen3OmniDataPlaneSession(DuplexDataPlane):
         finished = bool(outer_finished or getattr(output, "finished", False))
         is_final_audio_stage = stage_id is None or stage_id >= _CODE2WAV_STAGE_ID
         mm = _multimodal(output, completion)
-        audio = _audio_value(mm)
-        if audio is not None and (stage_id is None or stage_id != _THINKER_STAGE_ID):
+        audio = _audio_payload(mm)
+        if audio is not None and is_final_audio_stage:
             sample_rate = _sample_rate(mm)
-            encoded = self._encode_audio(audio, sample_rate, "wav", None)
-            if encoded:
-                state.audio_offset += _audio_num_samples(audio)
-                end_of_turn = bool(finished and is_final_audio_stage)
+            response_format = _context_response_format(context)
+            speed = _context_speed(context)
+            new_pieces = list(_iter_new_audio(audio, state))
+            for index, piece in enumerate(new_pieces):
+                encoded = self._encode_audio(piece, sample_rate, response_format, speed)
+                if not encoded:
+                    continue
+                delta_samples = _audio_num_samples(piece)
+                end_of_turn = bool(finished and is_final_audio_stage and index == len(new_pieces) - 1)
                 event = {
                     "stage_role": "tts",
                     "is_listen": False,
                     "data_plane_request_id": request_id,
                     "audio": encoded,
+                    "audio_format": response_format,
                     "sample_rate_hz": sample_rate,
+                    "audio_duration_ms": int(delta_samples * 1000 / max(1, sample_rate)),
                     "end_of_turn": end_of_turn,
                 }
                 if isinstance(turn_id, int):

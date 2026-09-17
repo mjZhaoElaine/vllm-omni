@@ -84,24 +84,62 @@ def test_plan_append_commit_builds_thinker_prompt() -> None:
     assert "prompt_token_ids" not in plan.prompt
 
 
-def test_plan_append_skips_non_final_chunks() -> None:
+def test_plan_append_rejects_non_final_chunks() -> None:
     plugin = Qwen3OmniDuplexPlugin(_encode_audio)
     fence = DuplexFence("sess-1")
     streaming = dict(_pcm_payload())
     streaming.pop("turn_commit", None)
     streaming["final"] = False
-    plan = plugin.plan_append(
-        request_id="req",
-        fence=fence,
-        session_config={},
-        runtime_config={},
-        seq=1,
-        turn_seq=1,
-        payload=streaming,
-        final=False,
-        sampling_params=SamplingParams(max_tokens=8),
-    )
-    assert plan.prompt["additional_information"]["qwen3_skip_submit"] is True
+    with pytest.raises(ValueError, match="committed final turn"):
+        plugin.plan_append(
+            request_id="req",
+            fence=fence,
+            session_config={},
+            runtime_config={},
+            seq=1,
+            turn_seq=1,
+            payload=streaming,
+            final=False,
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+
+
+def test_plan_append_requires_audio() -> None:
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    fence = DuplexFence("sess-1")
+    missing = dict(_pcm_payload())
+    missing["audio"] = ""
+    with pytest.raises(ValueError, match="requires audio"):
+        plugin.plan_append(
+            request_id="req",
+            fence=fence,
+            session_config={},
+            runtime_config={},
+            seq=1,
+            turn_seq=1,
+            payload=missing,
+            final=True,
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+
+
+def test_plan_append_rejects_bad_base64() -> None:
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    fence = DuplexFence("sess-1")
+    payload = dict(_pcm_payload())
+    payload["audio"] = "%%%not-base64%%%"
+    with pytest.raises(ValueError, match="valid base64"):
+        plugin.plan_append(
+            request_id="req",
+            fence=fence,
+            session_config={},
+            runtime_config={},
+            seq=1,
+            turn_seq=1,
+            payload=payload,
+            final=True,
+            sampling_params=SamplingParams(max_tokens=8),
+        )
 
 
 def test_observe_stage_output_targets_thinker_only() -> None:
@@ -138,3 +176,11 @@ async def test_prepare_runtime_config_seeds_chat_text() -> None:
     runtime = await plugin.prepare_runtime_config(config, model_config=None)
     assert runtime["qwen3_system_prompt"] == "be brief"
     assert runtime["initial_user_text"] == "hello from chat"
+
+
+def test_validate_client_extra_body_requires_object() -> None:
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    plugin.validate_client_extra_body(None)
+    plugin.validate_client_extra_body({})
+    with pytest.raises(ValueError, match="extra_body must be an object"):
+        plugin.validate_client_extra_body(["not", "a", "dict"])
