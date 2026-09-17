@@ -80,9 +80,9 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
 
 QWEN3_OMNI_DUPLEX_PLUGIN = "vllm_omni.model_executor.models.qwen3_omni.duplex.plugin.Qwen3OmniDuplexPlugin"
 
-# Opt-in duplex serving: same Thinker→Talker→Code2Wav topology as the stock
-# pipeline, selected via deploy YAML ``pipeline: qwen3_omni_moe_duplex`` plus
-# ``session_mode: duplex``. The stock ``qwen3_omni_moe`` entry is unchanged.
+# Duplex serving: same Thinker→Talker→Code2Wav topology as the stock
+# pipeline. Select with ``pipeline: qwen3_omni_moe_duplex`` and
+# ``session_mode: duplex``.
 QWEN3_OMNI_DUPLEX_PIPELINE = replace(
     QWEN3_OMNI_PIPELINE,
     model_type="qwen3_omni_moe_duplex",

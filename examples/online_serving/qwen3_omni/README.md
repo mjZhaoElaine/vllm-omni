@@ -40,21 +40,14 @@ Captioner / Thinking checkpoints (`enable_audio_output=false`) still auto-select
 the same single-stage pipeline without `--deploy-config`.
 
 To serve **turn-based Server VAD** on `/v1/realtime` (server-side endpointing,
-auto-commit, automatic response), pass the duplex pipeline variant. Stock
-`qwen3_omni_moe` deployments stay turn-based and do not load a duplex plugin.
-Pre-#7413 YAMLs that used `session_mode: turn` plus a `duplex_session:` block
-must migrate to this variant — that combination is no longer consumed:
+auto-commit, automatic response), pass the bundled duplex deploy YAML.
+The `pipeline:` key `qwen3_omni_moe_duplex` loads the duplex plugin; the YAML
+also sets `session_mode: duplex`. Use Instruct weights:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     --deploy-config vllm_omni/deploy/qwen3_omni_moe_duplex.yaml
 ```
-
-The YAML sets `pipeline: qwen3_omni_moe_duplex` and `session_mode: duplex`.
-Omitting `session_mode: duplex` on the variant fails startup with a clear
-error. Existing `session_mode: turn` Qwen3-Omni deployments are unchanged.
-Use Instruct weights; a Captioner/Thinking checkpoint plus this YAML would
-still try the three-stage duplex plugin.
 
 For a 3x-GPU multi-replica layout (talker/code2wav scale-out on cuda:1,2),
 use `--stage-overrides` on top of the default config:
@@ -330,12 +323,8 @@ duplex_session:
   server_vad_model_path: /models/silero_vad.onnx
 ```
 
-Use the bundled duplex deploy YAML (`vllm_omni/deploy/qwen3_omni_moe_duplex.yaml`).
-It already sets `pipeline: qwen3_omni_moe_duplex` and `session_mode: duplex`.
-Optionally add `duplex_session.server_vad_model_path` on a copy of **that**
-file — not on the stock turn-based `qwen3_omni_moe.yaml`. Combining
-`session_mode: turn` with a `duplex_session:` block is the pre-#7413 recipe
-and is no longer consumed.
+Serve with the bundled duplex deploy YAML. Optionally add
+`duplex_session.server_vad_model_path` on a copy of that file:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
@@ -344,9 +333,8 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --deploy-config vllm_omni/deploy/qwen3_omni_moe_duplex.yaml
 ```
 
-Bare `/v1/realtime` selects the duplex handler. The client uses `?duplex=0`
-only for the existing non-Server-VAD wire flow; `?duplex=1` remains a
-supported compatibility alias.
+Bare `/v1/realtime` selects the duplex handler. Use `?duplex=0` for the
+existing non-Server-VAD wire flow; `?duplex=1` is a compatibility alias.
 
 The Python client supports the following command-line arguments:
 

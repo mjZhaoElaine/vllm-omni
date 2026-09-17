@@ -1,7 +1,6 @@
-# Qwen3-Omni-MoE duplex deploy: same hardware layout as qwen3_omni_moe.yaml,
-# opt-in via pipeline variant + session_mode. Pre-#7413 YAMLs that used
-# session_mode: turn plus a duplex_session: block do not auto-restore Server
-# VAD; migrate them here (pipeline: qwen3_omni_moe_duplex, session_mode: duplex).
+# Qwen3-Omni-MoE duplex deploy: same hardware layout as qwen3_omni_moe.yaml.
+# Serve with pipeline: qwen3_omni_moe_duplex and session_mode: duplex
+# (both are set below).
 #
 # Fields omitted from a stage fall back to StageDeployConfig defaults (see
 # vllm_omni/config/stage_config.py). Notable implicit defaults for this

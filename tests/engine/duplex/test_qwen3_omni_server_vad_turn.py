@@ -285,8 +285,8 @@ async def test_server_vad_turn_submits_one_ephemeral_qwen3_request() -> None:
         assert prompt.get("additional_information", {}).get("qwen3_duplex") is True
 
         request_id = submission.context.request_id
-        # observe_stage_output projects Thinker text but must still forward
-        # (on_stage_output returns False => orchestrator keeps the pipeline).
+        # observe_stage_output projects Thinker text; the orchestrator
+        # continues Talker/Code2Wav.
         forwarded = h.deliver(fake_thinker(request_id, "hello there"), stage_id=0)
         assert forwarded is False
         await h.settle()

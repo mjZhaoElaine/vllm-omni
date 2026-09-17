@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Qwen3-Omni full-duplex plugin: one ephemeral Thinker→Talker→Code2Wav request per turn."""
+"""Qwen3-Omni duplex plugin: one ephemeral Thinker→Talker→Code2Wav request per turn."""
 
 from __future__ import annotations
 
@@ -154,7 +154,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         output: object,
         context: object,
     ) -> bool:
-        """Project Thinker text to the client without short-circuiting Talker/Code2Wav."""
+        """Project Thinker text to the client and keep forwarding Talker/Code2Wav."""
         del output, context
         return stage_id == _THINKER_STAGE_ID
 
