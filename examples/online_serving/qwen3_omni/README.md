@@ -39,6 +39,21 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
 Captioner / Thinking checkpoints (`enable_audio_output=false`) still auto-select
 the same single-stage pipeline without `--deploy-config`.
 
+To serve **turn-based Server VAD** on `/v1/realtime` (server-side endpointing,
+auto-commit, automatic response), pass the duplex pipeline variant. Stock
+`qwen3_omni_moe` deployments stay turn-based and do not load a duplex plugin.
+Pre-#7413 YAMLs that used `session_mode: turn` plus a `duplex_session:` block
+must migrate to this variant — that combination is no longer consumed:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/qwen3_omni_moe_duplex.yaml
+```
+
+The YAML sets `pipeline: qwen3_omni_moe_duplex` and `session_mode: duplex`.
+Omitting `session_mode: duplex` on the variant fails startup with a clear
+error. Existing `session_mode: turn` Qwen3-Omni deployments are unchanged.
+
 For a 3x-GPU multi-replica layout (talker/code2wav scale-out on cuda:1,2),
 use `--stage-overrides` on top of the default config:
 
