@@ -59,6 +59,7 @@ def test_load_qwen3_omni_duplex_plugin_and_capabilities() -> None:
     assert caps.supports_turn_commit_only is True
     assert caps.supports_core_resumable_request is False
     assert caps.supports_chat_completions is True
+    assert caps.supports_text_only_turn is True
     assert caps.supports_barge_in is False
 
 
@@ -81,7 +82,6 @@ def test_plan_append_commit_builds_thinker_prompt() -> None:
     assert info["session_id"] == "sess-1"
     assert "audio" in plan.prompt["multi_modal_data"]
     assert "<|audio_pad|>" in plan.prompt["prompt"]
-    assert "prompt_token_ids" not in plan.prompt
 
 
 def test_plan_append_rejects_non_final_chunks() -> None:
@@ -109,7 +109,7 @@ def test_plan_append_requires_audio() -> None:
     fence = DuplexFence("sess-1")
     missing = dict(_pcm_payload())
     missing["audio"] = ""
-    with pytest.raises(ValueError, match="requires audio"):
+    with pytest.raises(ValueError, match="requires audio or text"):
         plugin.plan_append(
             request_id="req",
             fence=fence,
@@ -121,6 +121,88 @@ def test_plan_append_requires_audio() -> None:
             final=True,
             sampling_params=SamplingParams(max_tokens=8),
         )
+
+
+def test_plan_append_second_turn_renders_history() -> None:
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    plan = plugin.plan_append(
+        request_id="req",
+        fence=DuplexFence("sess-1", turn_id=1),
+        session_config={
+            "conversation": [
+                {"role": "user", "content": "My code name is Orchid Falcon."},
+                {"role": "assistant", "content": 'I will remember "Orchid Falcon".'},
+                {"role": "user", "content": [{"type": "audio_url", "audio_url": {"url": "native-duplex:input-audio"}}]},
+            ]
+        },
+        runtime_config={"qwen3_system_prompt": "sys"},
+        seq=2,
+        turn_seq=1,
+        payload=_pcm_payload(),
+        final=True,
+        sampling_params=SamplingParams(max_tokens=8),
+    )
+    rendered = plan.prompt["prompt"]
+    assert "Orchid Falcon" in rendered
+    assert "I will remember" in rendered
+    assert rendered.count("<|im_start|>assistant") == 2
+
+
+def test_plan_append_text_only_does_not_fail_closed() -> None:
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    plan = plugin.plan_append(
+        request_id="req",
+        fence=DuplexFence("sess-1"),
+        session_config={"conversation": [{"role": "user", "content": "What is 2+2?"}]},
+        runtime_config={},
+        seq=1,
+        turn_seq=1,
+        payload={"type": "text", "final": True},
+        final=True,
+        sampling_params=SamplingParams(max_tokens=8),
+    )
+    assert "What is 2+2?" in plan.prompt["prompt"]
+    assert "multi_modal_data" not in plan.prompt
+
+
+def test_runtime_config_for_update_replaces_instructions() -> None:
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    current = {"qwen3_system_prompt": "old", "instructions": "old"}
+    updated = plugin.runtime_config_for_update(
+        DuplexSessionConfig(model="Qwen/Qwen3-Omni", instructions="be terse"),
+        current,
+    )
+    assert updated["qwen3_system_prompt"] == "be terse"
+    assert updated["instructions"] == "be terse"
+
+
+def test_runtime_config_for_update_keeps_explicit_system_prompt() -> None:
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    updated = plugin.runtime_config_for_update(
+        DuplexSessionConfig(
+            model="Qwen/Qwen3-Omni",
+            instructions="be terse",
+            extra_body={"qwen3_system_prompt": "override"},
+        ),
+        {"qwen3_system_prompt": "old"},
+    )
+    assert updated["qwen3_system_prompt"] == "override"
+
+
+def test_configure_sampling_params_applies_runtime() -> None:
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    defaults = (
+        SamplingParams(max_tokens=2048, temperature=0.9),
+        SamplingParams(max_tokens=4096),
+        SamplingParams(max_tokens=16),
+    )
+    configured = plugin.configure_sampling_params(
+        runtime_config={"max_tokens": 16, "temperature": 0.2},
+        defaults=defaults,
+    )
+    assert configured[0].max_tokens == 16
+    assert configured[0].temperature == 0.2
+    assert QWEN3_OMNI_TALKER_EOS_TOKEN_ID in (configured[1].stop_token_ids or [])
 
 
 def test_plan_append_rejects_bad_base64() -> None:

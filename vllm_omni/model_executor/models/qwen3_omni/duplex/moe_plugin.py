@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import binascii
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 import pybase64 as base64
@@ -44,8 +44,12 @@ _PRIVATE_KEYS = frozenset(
     {
         "qwen3_system_prompt",
         "initial_user_text",
+        "temperature",
+        "max_tokens",
     }
 )
+
+_MAX_HISTORY_MESSAGES = 16
 
 
 def _decode_pcm_f32le(payload: Mapping[str, object]) -> tuple[np.ndarray, int]:
@@ -63,14 +67,63 @@ def _decode_pcm_f32le(payload: Mapping[str, object]) -> tuple[np.ndarray, int]:
     return values, sample_rate_hz
 
 
-def _thinker_prompt(*, system_prompt: str, user_text: str) -> str:
-    extra = user_text if user_text else ""
-    return (
-        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>"
-        f"{extra}<|im_end|>\n"
-        "<|im_start|>assistant\n"
-    )
+def _content_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    chunks: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        for key in ("text", "transcript"):
+            value = part.get(key)
+            if isinstance(value, str) and value:
+                chunks.append(value)
+                break
+    return "".join(chunks)
+
+
+def _message_text(message: Mapping[str, object]) -> str:
+    transcript = message.get("transcript")
+    if isinstance(transcript, str) and transcript.strip():
+        return transcript
+    return _content_text(message.get("content"))
+
+
+def _conversation_from(session_config: Mapping[str, object]) -> list[Mapping[str, object]]:
+    raw = session_config.get("conversation")
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return []
+    return [item for item in raw if isinstance(item, Mapping)]
+
+
+def _thinker_prompt(
+    *,
+    system_prompt: str,
+    history: Sequence[Mapping[str, object]],
+    user_text: str,
+    has_audio: bool,
+) -> str:
+    prior = list(history)
+    current_text = user_text
+    if prior and prior[-1].get("role") == "user":
+        last = prior.pop()
+        if not current_text:
+            current_text = _message_text(last)
+    parts = [f"<|im_start|>system\n{system_prompt}<|im_end|>\n"]
+    for message in prior[-_MAX_HISTORY_MESSAGES:]:
+        role = message.get("role")
+        text = _message_text(message)
+        if role == "user":
+            parts.append(f"<|im_start|>user\n{text}<|im_end|>\n")
+        elif role == "assistant":
+            parts.append(f"<|im_start|>assistant\n{text}<|im_end|>\n")
+    audio = "<|audio_start|><|audio_pad|><|audio_end|>" if has_audio else ""
+    extra = current_text if current_text else ""
+    parts.append(f"<|im_start|>user\n{audio}{extra}<|im_end|>\n")
+    parts.append("<|im_start|>assistant\n")
+    return "".join(parts)
 
 
 class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
@@ -89,8 +142,16 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         runtime_config: dict[str, object],
         defaults: tuple[object, ...],
     ) -> tuple[object, ...]:
-        del runtime_config
         configured = list(defaults)
+        if configured and isinstance(configured[_THINKER_STAGE_ID], SamplingParams):
+            thinker = configured[_THINKER_STAGE_ID].clone()
+            max_tokens = runtime_config.get("max_tokens")
+            if isinstance(max_tokens, int) and max_tokens > 0:
+                thinker.max_tokens = max_tokens
+            temperature = runtime_config.get("temperature")
+            if isinstance(temperature, int | float):
+                thinker.temperature = float(temperature)
+            configured[_THINKER_STAGE_ID] = thinker
         if len(configured) > _TALKER_STAGE_ID and isinstance(configured[_TALKER_STAGE_ID], SamplingParams):
             talker = configured[_TALKER_STAGE_ID].clone()
             stop_ids = list(talker.stop_token_ids or [])
@@ -113,7 +174,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         final: bool,
         sampling_params: object,
     ) -> DuplexAppendPlan:
-        del request_id, session_config, seq, turn_seq, sampling_params
+        del request_id, seq, turn_seq, sampling_params
 
         if not final:
             raise ValueError("Qwen3-Omni duplex plan_append only accepts a committed final turn")
@@ -122,15 +183,26 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
 
         audio_b64 = payload.get("audio")
         has_audio = isinstance(audio_b64, str) and bool(audio_b64)
-        if not has_audio:
-            raise ValueError("Qwen3-Omni duplex commit requires audio")
-        wav, sample_rate_hz = _decode_pcm_f32le(payload)
-        if wav.size == 0:
-            raise ValueError("Qwen3-Omni duplex commit requires non-empty audio")
+        wav: np.ndarray | None = None
+        sample_rate_hz = 16000
+        if has_audio:
+            wav, sample_rate_hz = _decode_pcm_f32le(payload)
+            if wav.size == 0:
+                raise ValueError("Qwen3-Omni duplex commit requires non-empty audio")
+
+        payload_text = payload.get("text")
+        user_text = payload_text if isinstance(payload_text, str) else ""
+        if not user_text:
+            seeded = runtime_config.get("initial_user_text")
+            user_text = seeded if isinstance(seeded, str) else ""
+        history = _conversation_from(session_config)
+        if not has_audio and not user_text:
+            if history and history[-1].get("role") == "user":
+                user_text = _message_text(history[-1])
+        if not has_audio and not user_text:
+            raise ValueError("Qwen3-Omni duplex commit requires audio or text")
 
         system_prompt = str(runtime_config.get("qwen3_system_prompt") or DEFAULT_SYSTEM_PROMPT)
-        user_text = runtime_config.get("initial_user_text")
-        user_text = user_text if isinstance(user_text, str) else ""
 
         additional_information: dict[str, object] = {
             "qwen3_system_prompt": system_prompt,
@@ -141,10 +213,16 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             "is_speech": bool(payload.get("is_speech", True)),
         }
         prompt: dict[str, object] = {
-            "prompt": _thinker_prompt(system_prompt=system_prompt, user_text=user_text),
-            "multi_modal_data": {"audio": (wav, sample_rate_hz)},
+            "prompt": _thinker_prompt(
+                system_prompt=system_prompt,
+                history=history,
+                user_text=user_text,
+                has_audio=has_audio,
+            ),
             "additional_information": additional_information,
         }
+        if has_audio and wav is not None:
+            prompt["multi_modal_data"] = {"audio": (wav, sample_rate_hz)}
         return DuplexAppendPlan(prompt=prompt)
 
     def project_intermediate_output(
@@ -193,6 +271,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             "qwen3_system_prompt": str(system_prompt),
             "instructions": str(system_prompt),
         }
+        if isinstance(config.temperature, int | float):
+            runtime["temperature"] = float(config.temperature)
+        if isinstance(config.max_tokens, int) and config.max_tokens > 0:
+            runtime["max_tokens"] = config.max_tokens
         initial_user_text = extra.get("duplex_initial_user_text")
         if not (isinstance(initial_user_text, str) and initial_user_text):
             initial_user_text = config.initial_user_text
@@ -211,7 +293,12 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             updated["qwen3_system_prompt"] = str(extra["qwen3_system_prompt"])
         if config.instructions:
             updated["instructions"] = config.instructions
-            updated.setdefault("qwen3_system_prompt", config.instructions)
+            if "qwen3_system_prompt" not in extra:
+                updated["qwen3_system_prompt"] = config.instructions
+        if isinstance(config.temperature, int | float):
+            updated["temperature"] = float(config.temperature)
+        if isinstance(config.max_tokens, int) and config.max_tokens > 0:
+            updated["max_tokens"] = config.max_tokens
         extra_user_text = extra.get("duplex_initial_user_text")
         if isinstance(extra_user_text, str) and extra_user_text:
             updated["initial_user_text"] = extra_user_text

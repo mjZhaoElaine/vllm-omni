@@ -84,6 +84,7 @@ class RecordingStagePort(DuplexStagePort):
         self._stage_count = stage_count
         self.ensured: list[DuplexStageRequestContext] = []
         self.submissions: list[DuplexStageSubmission] = []
+        self.cleaned: list[tuple[list[str], bool]] = []
 
     @property
     def stage_count(self) -> int:
@@ -104,7 +105,7 @@ class RecordingStagePort(DuplexStagePort):
         )
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
-        del request_ids, abort
+        self.cleaned.append((list(request_ids), abort))
 
     async def abort_requests(self, request_ids: list[str]) -> None:
         del request_ids
@@ -205,12 +206,18 @@ def fake_code2wav(request_id: str) -> SimpleNamespace:
         stage_id=2,
         finished=True,
         duplex_turn_id=0,
-        outputs=[SimpleNamespace(text="", token_ids=[], multimodal_output={"audio": audio, "sr": 24000})],
-        multimodal_output={"audio": audio, "sr": 24000},
+        outputs=[SimpleNamespace(text="", token_ids=[], multimodal_output={"model_outputs": audio, "sr": 24000})],
+        multimodal_output={"model_outputs": audio, "sr": 24000},
     )
 
 
-async def open_harness(scores: Sequence[float] | None = None, *, server_vad: bool = True) -> Harness:
+async def open_harness(
+    scores: Sequence[float] | None = None,
+    *,
+    server_vad: bool = True,
+    interrupt_response: bool = True,
+    extra: dict[str, object] | None = None,
+) -> Harness:
     plugin = Qwen3OmniDuplexPlugin(_encode_audio)
     port = RecordingStagePort(stage_count=3)
     output: asyncio.Queue[Any] = asyncio.Queue()
@@ -238,8 +245,10 @@ async def open_harness(scores: Sequence[float] | None = None, *, server_vad: boo
             "silence_duration_ms": 100,
             "min_speech_duration_ms": 32,
             "create_response": True,
-            "interrupt_response": True,
+            "interrupt_response": interrupt_response,
         }
+    if extra:
+        payload.update(extra)
     config = DuplexSessionConfig.from_realtime(payload)
     await manager.handle(OpenDuplexSessionMessage(control_id="c-open", session_id=SESSION_ID, session_config=config))
     result = await asyncio.wait_for(results.get(), timeout=2.0)
@@ -349,5 +358,125 @@ async def test_client_commit_submits_one_ephemeral_request() -> None:
         assert submission.context.request_id.endswith(".r.stage0-turn0")
         assert submission.already_submitted is False
         assert submission.resumable is False
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_second_turn_prompt_contains_prior_assistant_text() -> None:
+    scores = _one_utterance_scores() + _one_utterance_scores()
+    h = await open_harness(scores)
+    try:
+        await h.run(commands.AppendAudio(audio=pcm_f32(FRAME_SAMPLES * 10), format="pcm_f32le", sample_rate_hz=16000))
+        first = h.port.submissions[0]
+        await h.deliver_and_settle(fake_thinker(first.context.request_id, "I will remember Orchid Falcon."), stage_id=0)
+        await h.deliver_and_settle(fake_code2wav(first.context.request_id), stage_id=2)
+        assert "response.done" in types(h.events)
+        history_text = " ".join(str(item.get("content", "")) for item in h.runner.session.history)
+        assert "Orchid Falcon" in history_text
+
+        await h.run(commands.AppendAudio(audio=pcm_f32(FRAME_SAMPLES * 10), format="pcm_f32le", sample_rate_hz=16000))
+        second = h.port.submissions[1]
+        rendered = str(second.prompt.get("prompt", ""))
+        assert "Orchid Falcon" in rendered
+        assert rendered.count("<|im_start|>assistant") >= 2
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_completed_ephemeral_request_is_cleaned_up() -> None:
+    h = await open_harness(_one_utterance_scores())
+    try:
+        await h.run(commands.AppendAudio(audio=pcm_f32(FRAME_SAMPLES * 10), format="pcm_f32le", sample_rate_hz=16000))
+        first_id = h.port.submissions[0].context.request_id
+        await h.deliver_and_settle(fake_thinker(first_id, "hello there"), stage_id=0)
+        await h.deliver_and_settle(fake_code2wav(first_id), stage_id=2)
+        assert "response.done" in types(h.events)
+        cleaned_ids = [rid for ids, _abort in h.port.cleaned for rid in ids]
+        assert first_id in cleaned_ids
+        assert all(resource.request_id != first_id for resource in h.runner.session.request_resources.values())
+        assert h.runner.session.active_request_id != first_id
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_session_update_instructions_reach_the_next_thinker_prompt() -> None:
+    h = await open_harness(server_vad=False)
+    try:
+        events = await h.run(commands.UpdateSession(patch={"instructions": "Speak like a pirate."}))
+        assert "error" not in types(events)
+        await h.run(
+            commands.AppendAudio(
+                audio=pcm_f32(FRAME_SAMPLES * 4),
+                format="pcm_f32le",
+                sample_rate_hz=16000,
+                is_speech=True,
+            )
+        )
+        await h.run(commands.Commit(create_response=True, is_speech=True))
+        assert h.port.submissions
+        rendered = str(h.port.submissions[0].prompt.get("prompt", ""))
+        assert "Speak like a pirate." in rendered
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_session_sampling_update_reaches_thinker_params() -> None:
+    h = await open_harness(server_vad=False, extra={"max_output_tokens": 16, "temperature": 0.2})
+    try:
+        await h.run(
+            commands.AppendAudio(
+                audio=pcm_f32(FRAME_SAMPLES * 4),
+                format="pcm_f32le",
+                sample_rate_hz=16000,
+                is_speech=True,
+            )
+        )
+        await h.run(commands.Commit(create_response=True, is_speech=True))
+        submission = h.port.submissions[0]
+        thinker = submission.context.sampling_params[0]
+        assert thinker.max_tokens == 16
+        assert thinker.temperature == 0.2
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_text_only_response_create_submits_and_keeps_session_open() -> None:
+    h = await open_harness(server_vad=False)
+    try:
+        await h.run(
+            commands.CreateItem(
+                item={
+                    "id": "item_prompt",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "What is 2+2?"}],
+                }
+            )
+        )
+        events = await h.run(commands.CreateResponse(event_id="evt-resp"))
+        assert "error" not in types(events)
+        assert "text_only_turn_unsupported" not in [getattr(event, "code", None) for event in events]
+        assert len(h.port.submissions) == 1
+        rendered = str(h.port.submissions[0].prompt.get("prompt", ""))
+        assert "What is 2+2?" in rendered
+        assert "multi_modal_data" not in h.port.submissions[0].prompt
+        assert SESSION_ID in h.manager.runners
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_response_false_opens_listen_only_session() -> None:
+    h = await open_harness(interrupt_response=False)
+    try:
+        assert h.runner.session.config.overlap_policy == "listen_only"
+        turn_detection = h.runner.session.config.extra_body.get("realtime_turn_detection")
+        assert isinstance(turn_detection, dict)
+        assert turn_detection.get("interrupt_response") is False
     finally:
         await h.manager.shutdown()

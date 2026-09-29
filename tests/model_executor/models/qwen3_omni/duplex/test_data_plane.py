@@ -115,6 +115,35 @@ def test_data_plane_drains_new_list_chunks_only() -> None:
     assert events2[0]["end_of_turn"] is True
 
 
+def test_data_plane_finish_request_drops_bookkeeping() -> None:
+    plane = Qwen3OmniDataPlaneSession(RecordingEncoder())
+    plane.begin_request("req-a")
+    plane.begin_request("req-b")
+    plane.finish_request("req-a")
+    assert "req-a" not in plane._requests
+    assert "req-b" in plane._requests
+
+
+def test_data_plane_accepts_model_outputs_key() -> None:
+    encoder = RecordingEncoder()
+    plane = Qwen3OmniDataPlaneSession(encoder)
+    request_id = "sess.e0.r.stage0_t0"
+    plane.begin_request(request_id)
+    audio = np.zeros(8, dtype=np.float32)
+    mm = {"model_outputs": audio, "sr": 24000}
+    output = SimpleNamespace(
+        request_id=request_id,
+        stage_id=2,
+        finished=True,
+        outputs=[SimpleNamespace(text="", multimodal_output=mm)],
+        multimodal_output=mm,
+    )
+    events = list(plane.project_output(output))
+    assert events[0]["stage_role"] == "tts"
+    assert events[0]["audio"] == "enc-8-wav"
+    assert events[0]["end_of_turn"] is True
+
+
 def test_data_plane_ignores_talker_latent() -> None:
     encoder = RecordingEncoder()
     plane = Qwen3OmniDataPlaneSession(encoder)

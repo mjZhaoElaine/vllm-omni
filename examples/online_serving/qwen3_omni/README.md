@@ -353,8 +353,12 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --deploy-config vllm_omni/deploy/qwen3_omni_moe_duplex.yaml
 ```
 
-Bare `/v1/realtime` selects the duplex handler. Use `?duplex=0` for the
-existing non-Server-VAD wire flow; `?duplex=1` is a compatibility alias.
+Bare `/v1/realtime` selects the duplex handler. `?duplex=0` does **not**
+fall back to the turn-based Realtime handler on this YAML — duplex
+startup leaves that handler unset, so the socket closes with
+"Realtime API is not available". Use the stock
+`vllm_omni/deploy/qwen3_omni_moe.yaml` deploy for the legacy
+non-Server-VAD wire flow. `?duplex=1` remains a compatibility alias.
 
 The Python client supports the following command-line arguments:
 

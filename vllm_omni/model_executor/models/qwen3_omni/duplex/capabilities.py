@@ -32,6 +32,7 @@ def qwen3_omni_duplex_capabilities(*, max_sessions: int = 1) -> DuplexCapabiliti
         session_admission_mode="engine_managed",
         supports_audio_truncate=False,
         supports_chat_completions=True,
+        supports_text_only_turn=True,
         requires_model_runner_kv=False,
         requires_native_stage_role=False,
         adapter_patterns=["turn_commit"],

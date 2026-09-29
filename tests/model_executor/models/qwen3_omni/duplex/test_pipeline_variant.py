@@ -40,7 +40,12 @@ def test_registry_resolves_duplex_variant_without_touching_stock() -> None:
     duplex = resolve_pipeline_config("qwen3_omni_moe_duplex")
     thinker_only = resolve_pipeline_config("qwen3_omni_moe_thinker_only")
     assert duplex is QWEN3_OMNI_DUPLEX_PIPELINE
-    assert QWEN3_OMNI_PIPELINE.duplex_plugin is None
+    assert QWEN3_OMNI_PIPELINE.duplex_plugin == (
+        "vllm_omni.model_executor.models.qwen3_omni.duplex.plugin.Qwen3OmniDuplexPlugin"
+    )
+    assert QWEN3_OMNI_DUPLEX_PIPELINE.duplex_plugin == (
+        "vllm_omni.model_executor.models.qwen3_omni.duplex.moe_plugin.Qwen3OmniDuplexPlugin"
+    )
     assert QWEN3_OMNI_PIPELINE is not duplex
     assert thinker_only is OMNI_PIPELINES["qwen3_omni_moe_thinker_only"]
 
@@ -73,7 +78,7 @@ def test_stock_and_moe_duplex_plugins_are_distinct() -> None:
 
 
 def test_duplex_engine_loads_plugin_when_session_mode_is_duplex() -> None:
-    from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.moe_plugin import Qwen3OmniDuplexPlugin
 
     stub = SimpleNamespace(
         model="Qwen/Qwen3-Omni-30B-A3B-Instruct",

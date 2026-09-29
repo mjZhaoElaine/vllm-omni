@@ -79,8 +79,10 @@ def _multimodal(output: object, completion: object | None) -> dict[str, object]:
 
 
 def _audio_payload(metadata: Mapping[str, object]) -> object | None:
-    """Code2Wav PCM under the ``audio`` key."""
-    return metadata.get("audio")
+    """Code2Wav PCM under ``audio`` or the turn-based ``model_outputs`` key."""
+    if "audio" in metadata:
+        return metadata.get("audio")
+    return metadata.get("model_outputs")
 
 
 def _context_response_format(context: object | None) -> str:
@@ -173,10 +175,10 @@ class Qwen3OmniDataPlaneSession(DuplexDataPlane):
         self._requests.setdefault(request_id, _RequestState()).terminal = True
 
     def close_stream(self, request_id: str) -> None:
-        state = self._requests.get(request_id)
-        if state is not None:
-            state.audio_offset = 0
-            state.chunks_drained = 0
+        self.finish_request(request_id)
+
+    def finish_request(self, request_id: str) -> None:
+        self._requests.pop(request_id, None)
 
     def close_session(self, session_id: str, *, active_request_id: str | None = None) -> None:
         if active_request_id is not None:
