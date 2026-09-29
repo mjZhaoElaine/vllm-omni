@@ -7,7 +7,7 @@ Four scenarios:
 - Ready CI: async_chunk on, smoke only (no send delay, no accuracy check).
 - Merge CI: async_chunk on + send delay, full accuracy check.
 - Merge CI: async_chunk off, no send delay, full accuracy check.
-- Server VAD: two turns without client commits.
+- Server VAD: two duplex turns without client commits (events + turn-2 recall).
 """
 
 from __future__ import annotations
@@ -57,6 +57,13 @@ ISSUE_6474_SYNTH_PHRASE_TEXT = (
     "Can you tell me the current temperature and weather conditions in New York City? "
     "What about Los Angeles? Please compare them in detail using at least eight complete sentences."
 )
+SERVER_VAD_TURN1_PHRASE_TEXT = "Remember that my secret code name is Orchid Falcon."
+SERVER_VAD_TURN2_PHRASE_TEXT = "What was my secret code name? Answer with those two words only."
+_SERVER_VAD_TEXT_EVENT_TYPES = (
+    "response.output_audio_transcript.delta",
+    "response.output_text.delta",
+    "transcription.delta",
+)
 
 # Simulate realtime upload pacing (``openai_realtime_client.py --send-delay-ms``).
 SEND_DELAY_MS = 200
@@ -64,14 +71,12 @@ CLIENT_VAD_REPLAY_PATH = Path(__file__).resolve().parents[2] / "assets" / "livek
 
 # CI overlay bakes in async_chunk: False and covers CUDA/ROCm/XPU via ``platforms:``.
 default_stage_config = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
+_server_vad_duplex_session: dict[str, Any] = {"max_sessions": 1}
+if SERVER_VAD_MODEL_PATH is not None:
+    _server_vad_duplex_session["server_vad_model_path"] = SERVER_VAD_MODEL_PATH
 server_vad_stage_config = modify_stage_config(
-    default_stage_config,
-    {
-        "async_chunk": True,
-        "duplex_session": (
-            {"server_vad_model_path": SERVER_VAD_MODEL_PATH} if SERVER_VAD_MODEL_PATH is not None else {}
-        ),
-    },
+    get_deploy_config_path("qwen3_omni_moe_duplex.yaml"),
+    {"duplex_session": _server_vad_duplex_session},
 )
 
 realtime_sync_server_params = [
@@ -249,33 +254,63 @@ async def _append_pcm16_chunks(ws, pcm16: bytes, chunk_bytes: int) -> None:
         )
 
 
-async def _receive_server_vad_turn(ws) -> list[dict]:
+async def _receive_until_types(ws, stop_types: set[str], *, timeout_s: float = 600) -> list[dict]:
     events: list[dict] = []
     while True:
-        message = await asyncio.wait_for(ws.recv(), timeout=600)
+        message = await asyncio.wait_for(ws.recv(), timeout=timeout_s)
         if isinstance(message, bytes):
             continue
         event = json.loads(message)
         events.append(event)
         if event.get("type") == "error":
             raise AssertionError(f"WebSocket error: {event}")
-        if event.get("type") == "response.done":
+        if event.get("type") in stop_types:
             return events
+
+
+async def _receive_server_vad_turn(ws) -> list[dict]:
+    return await _receive_until_types(ws, {"response.done"})
+
+
+def _server_vad_turn_text(events: list[dict]) -> str:
+    done_text = ""
+    deltas: list[str] = []
+    for event in events:
+        event_type = event.get("type")
+        if event_type in _SERVER_VAD_TEXT_EVENT_TYPES:
+            delta = event.get("delta") or ""
+            if delta:
+                deltas.append(str(delta))
+        elif event_type in {"transcription.done", "response.output_audio_transcript.done"}:
+            text = event.get("text") or ""
+            if text:
+                done_text = str(text)
+    return done_text or "".join(deltas)
+
+
+def _server_vad_output_pcm(events: list[dict]) -> bytes:
+    chunks: list[bytes] = []
+    for event in events:
+        if event.get("type") != "response.output_audio.delta":
+            continue
+        payload = event.get("delta") or event.get("audio") or ""
+        if payload:
+            chunks.append(base64.b64decode(payload))
+    return b"".join(chunks)
 
 
 async def _run_server_vad_audio_roundtrips(
     host: str,
     port: int,
     model: str,
-    pcm16: bytes,
+    pcm16_turns: list[bytes],
     *,
     chunk_ms: int = 100,
-    turns: int = 2,
-) -> list[list[dict]]:
+) -> tuple[dict, list[list[dict]]]:
     chunk_bytes = max(16_000 * 2 // 1000 * chunk_ms, 2)
     turn_events: list[list[dict]] = []
 
-    async with websockets.connect(f"ws://{host}:{port}/v1/realtime", max_size=64 * 1024 * 1024) as ws:
+    async with websockets.connect(f"ws://{host}:{port}/v1/realtime?duplex=1", max_size=64 * 1024 * 1024) as ws:
         await ws.send(
             json.dumps(
                 {
@@ -286,21 +321,28 @@ async def _run_server_vad_audio_roundtrips(
                         "audio": {
                             "input": {
                                 "format": {"type": "audio/pcm", "rate": 16_000},
-                                "turn_detection": {"type": "server_vad"},
+                                "turn_detection": {
+                                    "type": "server_vad",
+                                    "silence_duration_ms": 500,
+                                    "create_response": True,
+                                    "interrupt_response": False,
+                                },
                             }
                         },
                     },
                 }
             )
         )
+        session_events = await _receive_until_types(ws, {"session.updated"})
+        session = next(event["session"] for event in session_events if event["type"] == "session.updated")
 
         silence = bytes(16_000 * 2 * 3 // 2)
-        for _ in range(turns):
+        for pcm16 in pcm16_turns:
             await _append_pcm16_chunks(ws, pcm16, chunk_bytes)
             await _append_pcm16_chunks(ws, silence, chunk_bytes)
             turn_events.append(await _receive_server_vad_turn(ws))
 
-    return turn_events
+    return session, turn_events
 
 
 def _output_text(response: dict) -> str:
@@ -418,11 +460,6 @@ def _synthetic_pcm16_input(
     )
     wav_bytes = base64.b64decode(syn["base64"])
     return _pcm16_mono_from_wav_bytes(wav_bytes, sample_rate_hz=24000)
-
-
-def _server_vad_pcm16_input() -> bytes:
-    """Load the fixed single-turn speech fixture used by the Server VAD E2E."""
-    return _pcm16_mono_from_wav_bytes(validated_input_wav().read_bytes())
 
 
 def _assert_realtime_smoke(result: dict) -> None:
@@ -562,27 +599,32 @@ class TestQwen3OmniRealtimeWebSocket:
         cached_silero_vad_artifact: str,
         omni_server,
     ) -> None:
-        """Two Qwen turns are endpointed without client commits."""
+        """Two duplex Qwen turns are endpointed without client commits.
+
+        Turn 2 must condition on turn 1 (Orchid Falcon). Event-only two-turn
+        is not enough.
+        """
         assert cached_silero_vad_artifact
         deploy = load_deploy_config(server_vad_stage_config)
-        assert deploy.session_mode == "turn"
+        assert deploy.session_mode == "duplex"
+        assert deploy.pipeline == "qwen3_omni_moe_duplex"
         assert deploy.async_chunk is True
-        assert deploy.duplex_session.server_vad_model_path == SERVER_VAD_MODEL_PATH
-        pcm16 = _server_vad_pcm16_input()
+        pcm_turns = [
+            _synthetic_pcm16_input(phrase_text=SERVER_VAD_TURN1_PHRASE_TEXT, duration_s=6),
+            _synthetic_pcm16_input(phrase_text=SERVER_VAD_TURN2_PHRASE_TEXT, duration_s=6),
+        ]
 
-        turns = asyncio.run(
+        updated_session, turns = asyncio.run(
             _run_server_vad_audio_roundtrips(
                 omni_server.host,
                 omni_server.port,
                 omni_server.model,
-                pcm16,
+                pcm_turns,
                 chunk_ms=100,
-                turns=2,
             )
         )
 
         assert len(turns) == 2
-        updated_session = next(event["session"] for event in turns[0] if event["type"] == "session.updated")
         effective_turn_detection = updated_session["audio"]["input"]["turn_detection"]
         assert effective_turn_detection["type"] == "server_vad"
         assert effective_turn_detection["silence_duration_ms"] == 500
@@ -626,11 +668,7 @@ class TestQwen3OmniRealtimeWebSocket:
                 "conversation.item.done",
             ]
             assert all(event["item"]["role"] == "user" for event in history_events)
-            output_pcm = b"".join(
-                base64.b64decode(event["delta"])
-                for event in events
-                if event["type"] == "response.output_audio.delta" and event.get("delta")
-            )
+            output_pcm = _server_vad_output_pcm(events)
             assert output_pcm
             assert created["id"] == done["id"]
             assert done["status"] == "completed"
@@ -639,6 +677,9 @@ class TestQwen3OmniRealtimeWebSocket:
 
         assert len(set(input_item_ids)) == 2
         assert len(set(response_ids)) == 2
+        turn2_text = _server_vad_turn_text(turns[1]).lower()
+        assert turn2_text, "Turn 2 must emit model text so recall can be checked"
+        assert "orchid" in turn2_text and "falcon" in turn2_text, turn2_text
 
     @pytest.mark.advanced_model
     @pytest.mark.omni
