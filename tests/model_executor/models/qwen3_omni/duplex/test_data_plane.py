@@ -159,3 +159,35 @@ def test_data_plane_ignores_talker_latent() -> None:
     )
     assert list(plane.project_output(talker)) == []
     assert encoder.calls == []
+
+
+def test_data_plane_thinker_finished_is_not_end_of_turn() -> None:
+    plane = Qwen3OmniDataPlaneSession(RecordingEncoder())
+    request_id = "sess.e0.r.stage0_t0"
+    plane.begin_request(request_id)
+    thinker = SimpleNamespace(
+        request_id=request_id,
+        stage_id=0,
+        finished=True,
+        outputs=[SimpleNamespace(text="hello", cumulative_text="hello", multimodal_output={})],
+        multimodal_output={},
+    )
+    events = list(plane.project_output(thinker))
+    assert events[0]["end_of_turn"] is False
+    assert plane.is_terminal(request_id) is False
+
+
+def test_data_plane_missing_stage_id_does_not_end_turn() -> None:
+    plane = Qwen3OmniDataPlaneSession(RecordingEncoder())
+    request_id = "sess.e0.r.stage0_t0"
+    plane.begin_request(request_id)
+    thinker = SimpleNamespace(
+        request_id=request_id,
+        stage_id=None,
+        finished=True,
+        outputs=[SimpleNamespace(text="hello", cumulative_text="hello", multimodal_output={})],
+        multimodal_output={},
+    )
+    events = list(plane.project_output(thinker))
+    assert events[0]["end_of_turn"] is False
+    assert plane.is_terminal(request_id) is False

@@ -224,7 +224,7 @@ class Qwen3OmniDataPlaneSession(DuplexDataPlane):
                 yield event
 
         finished = bool(outer_finished or getattr(output, "finished", False))
-        is_final_audio_stage = stage_id is None or stage_id >= _CODE2WAV_STAGE_ID
+        is_final_audio_stage = isinstance(stage_id, int) and stage_id >= _CODE2WAV_STAGE_ID
         mm = _multimodal(output, completion)
         audio = _audio_payload(mm)
         if audio is not None and is_final_audio_stage:

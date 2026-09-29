@@ -130,6 +130,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     """Turn-commit Qwen3-Omni: one ephemeral three-stage request per utterance."""
 
     plugin_id = "qwen3_omni"
+    projects_intermediate_outputs = True
     private_runtime_config_keys = _PRIVATE_KEYS
 
     def __init__(self, encode_audio: EncodeAudio) -> None:

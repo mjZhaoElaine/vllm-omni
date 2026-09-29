@@ -46,6 +46,7 @@ def test_load_qwen3_omni_duplex_plugin_and_capabilities() -> None:
     plugin = load_duplex_plugin(PLUGIN_PATH, _encode_audio)
     assert isinstance(plugin, Qwen3OmniDuplexPlugin)
     assert plugin.plugin_id == "qwen3_omni"
+    assert plugin.projects_intermediate_outputs is True
     defaults = (
         SamplingParams(max_tokens=16),
         SamplingParams(max_tokens=4096),
@@ -61,6 +62,7 @@ def test_load_qwen3_omni_duplex_plugin_and_capabilities() -> None:
     assert caps.supports_chat_completions is True
     assert caps.supports_text_only_turn is True
     assert caps.supports_barge_in is False
+    assert caps.supports_concurrent_turn_requests is False
 
 
 def test_plan_append_commit_builds_thinker_prompt() -> None:
