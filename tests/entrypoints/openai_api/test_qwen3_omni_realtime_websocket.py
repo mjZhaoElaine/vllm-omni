@@ -17,6 +17,7 @@ import base64
 import io
 import json
 import os
+import time
 import wave
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -242,34 +243,153 @@ async def _run_realtime_audio_roundtrip(
     }
 
 
-async def _append_pcm16_chunks(ws, pcm16: bytes, chunk_bytes: int) -> None:
-    for offset in range(0, len(pcm16), chunk_bytes):
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(pcm16[offset : offset + chunk_bytes]).decode("utf-8"),
-                }
+def _vad_diag(hypothesis: str, message: str) -> None:
+    print(f"[VAD_DIAG {hypothesis}] {message}", flush=True)
+
+
+def _trim_pcm16_to_first_utterance(
+    pcm16: bytes,
+    *,
+    sample_rate: int = 16_000,
+    trailing_silence_s: float = 1.0,
+) -> bytes:
+    """Keep one spoken phrase plus trailing silence so Server VAD commits once.
+
+    ``generate_synthetic_audio`` repeats the phrase with 0.18 s of zeros to fill
+    ``duration_s``. Dumping the whole clip looks like extra turns.
+    """
+    samples = np.frombuffer(pcm16, dtype="<i2")
+    raw_s = len(pcm16) / (sample_rate * 2)
+    if samples.size == 0:
+        _vad_diag("H1", f"trim empty raw_s={raw_s:.2f}")
+        return pcm16
+    silent = np.abs(samples.astype(np.int32)) < 200
+    speech = ~silent
+    if not np.any(speech):
+        _vad_diag("H1", f"trim no_speech raw_s={raw_s:.2f}")
+        return pcm16
+    start = int(np.argmax(speech))
+    gap = int(0.15 * sample_rate)
+    min_speech = int(0.4 * sample_rate)
+    silent_run = 0
+    end = samples.size
+    gap_cut = False
+    for index in range(start, samples.size):
+        if silent[index]:
+            silent_run += 1
+            if silent_run >= gap and (index - silent_run - start) >= min_speech:
+                end = index - silent_run + 1
+                gap_cut = True
+                break
+        else:
+            silent_run = 0
+    else:
+        spoken = np.flatnonzero(speech)
+        end = int(spoken[-1]) + 1
+    trailing = np.zeros(int(sample_rate * trailing_silence_s), dtype="<i2")
+    trimmed = np.concatenate([samples[start:end], trailing]).tobytes()
+    _vad_diag(
+        "H1",
+        f"raw_s={raw_s:.2f} speech_s={(end - start) / sample_rate:.2f} trimmed_s={len(trimmed) / (sample_rate * 2):.2f} gap_cut={gap_cut} start={start} end={end}",
+    )
+    return trimmed
+
+
+async def _append_one_user_utterance(
+    ws,
+    pcm16: bytes,
+    chunk_bytes: int,
+    events: list[dict],
+    *,
+    cursor: int,
+    send_delay_s: float,
+    on_event=None,
+    timeout_s: float = 600,
+) -> None:
+    """Send one spoken turn, then stop when Server VAD ends the utterance.
+
+    A human pauses after one phrase. Dumping the rest of a repeated synth clip
+    looks like a second ``speech_started`` during TTS.
+    """
+    stop_send = asyncio.Event()
+    sent_bytes = 0
+
+    async def sender() -> None:
+        nonlocal sent_bytes
+        for offset in range(0, len(pcm16), chunk_bytes):
+            if stop_send.is_set():
+                break
+            chunk = pcm16[offset : offset + chunk_bytes]
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(chunk).decode("utf-8"),
+                    }
+                )
             )
+            sent_bytes += len(chunk)
+            if send_delay_s <= 0:
+                continue
+            try:
+                await asyncio.wait_for(stop_send.wait(), timeout=send_delay_s)
+                break
+            except TimeoutError:
+                continue
+
+    def _on_event(event: dict) -> None:
+        if on_event is not None:
+            on_event(event)
+        if any(item.get("type") == "input_audio_buffer.speech_stopped" for item in events[cursor:]):
+            stop_send.set()
+
+    send_task = asyncio.create_task(sender())
+    try:
+        await _receive_until(
+            ws,
+            events,
+            lambda: any(event.get("type") == "response.done" for event in events[cursor:]),
+            timeout_s=timeout_s,
+            on_event=_on_event,
         )
+    finally:
+        stop_send.set()
+        await send_task
+    _vad_diag("H1", f"sent_bytes={sent_bytes}/{len(pcm16)} stopped_on_speech_stopped={sent_bytes < len(pcm16)}")
 
 
-async def _receive_until_types(ws, stop_types: set[str], *, timeout_s: float = 600) -> list[dict]:
-    events: list[dict] = []
-    while True:
-        message = await asyncio.wait_for(ws.recv(), timeout=timeout_s)
-        if isinstance(message, bytes):
-            continue
-        event = json.loads(message)
-        events.append(event)
-        if event.get("type") == "error":
-            raise AssertionError(f"WebSocket error: {event}")
-        if event.get("type") in stop_types:
-            return events
+def _event_types(events: list[dict]) -> list[str]:
+    return [str(event.get("type")) for event in events]
 
 
-async def _receive_server_vad_turn(ws) -> list[dict]:
-    return await _receive_until_types(ws, {"response.done"})
+async def _receive_until(
+    ws,
+    events: list[dict],
+    predicate,
+    *,
+    timeout_s: float = 600,
+    fatal_types: set[str] | frozenset[str] = frozenset({"error", "session.closed", "session.expired"}),
+    on_event=None,
+) -> None:
+    async def _pump() -> None:
+        while not predicate():
+            message = await ws.recv()
+            if isinstance(message, bytes):
+                continue
+            event = json.loads(message)
+            events.append(event)
+            if on_event is not None:
+                on_event(event)
+            event_type = event.get("type")
+            if event_type in fatal_types:
+                raise AssertionError(f"{event_type} before turn completed: {event}; types={_event_types(events)}")
+
+    try:
+        await asyncio.wait_for(_pump(), timeout=timeout_s)
+    except TimeoutError as exc:
+        raise AssertionError(f"Timed out waiting for duplex events; types={_event_types(events)}") from exc
+    except websockets.exceptions.ConnectionClosed as exc:
+        raise AssertionError(f"WebSocket closed ({exc}); types={_event_types(events)}") from exc
 
 
 def _server_vad_turn_text(events: list[dict]) -> str:
@@ -299,6 +419,45 @@ def _server_vad_output_pcm(events: list[dict]) -> bytes:
     return b"".join(chunks)
 
 
+def _completed_playback_cursor(events: list[dict]) -> tuple[str, int]:
+    done = next(event for event in events if event.get("type") == "response.done")
+    raw_response = done.get("response")
+    response: dict[str, object] = raw_response if isinstance(raw_response, dict) else {}
+    raw_id = done.get("response_id") or response.get("id")
+    if not isinstance(raw_id, str) or not raw_id:
+        raise AssertionError(f"response.done missing id: {done}")
+    raw_metadata = response.get("metadata")
+    metadata: dict[str, object] = raw_metadata if isinstance(raw_metadata, dict) else {}
+    raw_playback = metadata.get("playback")
+    playback: dict[str, object] = raw_playback if isinstance(raw_playback, dict) else {}
+    sent_ms = playback.get("sent_ms")
+    return raw_id, sent_ms if isinstance(sent_ms, int) else 0
+
+
+async def _ack_completed_playback(ws, events: list[dict], *, cursor: int, on_event=None) -> None:
+    """Realtime sessions are ack_only: the next Server VAD commit waits for this."""
+    response_id, sent_ms = _completed_playback_cursor(events[cursor:])
+    ack_cursor = len(events)
+    _vad_diag("H8", f"ack response_id={response_id} sent_ms={sent_ms}")
+    await ws.send(
+        json.dumps(
+            {
+                "type": "playback.ack",
+                "response_id": response_id,
+                "item_id": f"item_{response_id}",
+                "played_ms": sent_ms,
+                "committed_ms": sent_ms,
+            }
+        )
+    )
+    await _receive_until(
+        ws,
+        events,
+        lambda: any(event.get("type") == "playback.acknowledged" for event in events[ack_cursor:]),
+        on_event=on_event,
+    )
+
+
 async def _run_server_vad_audio_roundtrips(
     host: str,
     port: int,
@@ -308,40 +467,129 @@ async def _run_server_vad_audio_roundtrips(
     chunk_ms: int = 100,
 ) -> tuple[dict, list[list[dict]]]:
     chunk_bytes = max(16_000 * 2 // 1000 * chunk_ms, 2)
+    send_delay_s = chunk_ms / 1000.0
+    all_events: list[dict] = []
     turn_events: list[list[dict]] = []
+    session: dict | None = None
 
     async with websockets.connect(f"ws://{host}:{port}/v1/realtime?duplex=1", max_size=64 * 1024 * 1024) as ws:
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "type": "realtime",
-                        "model": model,
-                        "audio": {
-                            "input": {
-                                "format": {"type": "audio/pcm", "rate": 16_000},
-                                "turn_detection": {
-                                    "type": "server_vad",
-                                    "silence_duration_ms": 500,
-                                    "create_response": True,
-                                    "interrupt_response": False,
-                                },
-                            }
+        failed = True
+        try:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "model": model,
+                            "audio": {
+                                "input": {
+                                    "format": {"type": "audio/pcm", "rate": 16_000},
+                                    "turn_detection": {
+                                        "type": "server_vad",
+                                        "silence_duration_ms": 500,
+                                        "create_response": True,
+                                        "interrupt_response": False,
+                                    },
+                                }
+                            },
                         },
-                    },
-                }
+                    }
+                )
             )
-        )
-        session_events = await _receive_until_types(ws, {"session.updated"})
-        session = next(event["session"] for event in session_events if event["type"] == "session.updated")
+            await _receive_until(
+                ws,
+                all_events,
+                lambda: any(event.get("type") == "session.updated" for event in all_events),
+            )
+            session = next(event["session"] for event in all_events if event["type"] == "session.updated")
 
-        silence = bytes(16_000 * 2 * 3 // 2)
-        for pcm16 in pcm16_turns:
-            await _append_pcm16_chunks(ws, pcm16, chunk_bytes)
-            await _append_pcm16_chunks(ws, silence, chunk_bytes)
-            turn_events.append(await _receive_server_vad_turn(ws))
+            for turn_idx, pcm16 in enumerate(pcm16_turns, start=1):
+                cursor = len(all_events)
+                send_started = time.monotonic()
+                utterance = _trim_pcm16_to_first_utterance(pcm16)
+                _vad_diag(
+                    "H1",
+                    f"turn={turn_idx} raw_bytes={len(pcm16)} trimmed_bytes={len(utterance)} "
+                    f"chunk_ms={chunk_ms} send_s={len(utterance) / (16_000 * 2):.2f}",
+                )
 
+                def _on_event(event: dict, *, turn_idx: int = turn_idx, t0: float = send_started) -> None:
+                    event_type = str(event.get("type"))
+                    elapsed = time.monotonic() - t0
+                    if event_type == "overlap.decision":
+                        _vad_diag(
+                            "H3",
+                            f"turn={turn_idx} t={elapsed:.2f}s action={event.get('action')} "
+                            f"reason={event.get('reason')} policy={event.get('policy')}",
+                        )
+                        return
+                    if event_type in {
+                        "input_audio_buffer.speech_started",
+                        "input_audio_buffer.speech_stopped",
+                        "input_audio_buffer.committed",
+                        "response.created",
+                        "response.done",
+                        "response.listen",
+                        "playback.acknowledged",
+                        "session.expired",
+                        "session.closed",
+                        "error",
+                    }:
+                        extra = ""
+                        if event_type == "input_audio_buffer.committed":
+                            extra = (
+                                f" overlap_deferred={event.get('overlap_deferred')} "
+                                f"response_create_deferred={event.get('response_create_deferred')} "
+                                f"no_response={event.get('no_response')} empty={event.get('empty')}"
+                            )
+                            _vad_diag("H2", f"turn={turn_idx} t={elapsed:.2f}s extra_endpoint? {event_type}{extra}")
+                        elif event_type == "session.expired":
+                            _vad_diag("H7", f"turn={turn_idx} t={elapsed:.2f}s reason={event.get('reason')}")
+                        else:
+                            _vad_diag("H2", f"turn={turn_idx} t={elapsed:.2f}s {event_type}{extra}")
+
+                await _append_one_user_utterance(
+                    ws,
+                    utterance,
+                    chunk_bytes,
+                    all_events,
+                    cursor=cursor,
+                    send_delay_s=send_delay_s,
+                    on_event=_on_event,
+                )
+                _vad_diag("H1", f"turn={turn_idx} send_done_s={time.monotonic() - send_started:.2f}")
+                await _ack_completed_playback(ws, all_events, cursor=cursor, on_event=_on_event)
+                slice_events = all_events[cursor:]
+                turn_events.append(slice_events)
+                _vad_diag(
+                    "H2",
+                    "turn={} counts started={} stopped={} committed={} created={} done={} overlap={}".format(
+                        turn_idx,
+                        sum(1 for event in slice_events if event.get("type") == "input_audio_buffer.speech_started"),
+                        sum(1 for event in slice_events if event.get("type") == "input_audio_buffer.speech_stopped"),
+                        sum(1 for event in slice_events if event.get("type") == "input_audio_buffer.committed"),
+                        sum(1 for event in slice_events if event.get("type") == "response.created"),
+                        sum(1 for event in slice_events if event.get("type") == "response.done"),
+                        sum(1 for event in slice_events if event.get("type") == "overlap.decision"),
+                    ),
+                )
+            failed = False
+        finally:
+            try:
+                await ws.send(json.dumps({"type": "session.close"}))
+                await _receive_until(
+                    ws,
+                    all_events,
+                    lambda: any(event.get("type") == "session.closed" for event in all_events),
+                    timeout_s=15,
+                    fatal_types={"error"},
+                )
+            except Exception:
+                if not failed:
+                    raise
+
+    assert session is not None
     return session, turn_events
 
 
@@ -601,6 +849,7 @@ class TestQwen3OmniRealtimeWebSocket:
     ) -> None:
         """Two duplex Qwen turns are endpointed without client commits.
 
+        After each ``response.done`` the helper acks playback (ack_only).
         Turn 2 must condition on turn 1 (Orchid Falcon). Event-only two-turn
         is not enough.
         """
@@ -638,6 +887,7 @@ class TestQwen3OmniRealtimeWebSocket:
             "response.output_audio.delta",
             "response.output_audio.done",
             "response.done",
+            "playback.acknowledged",
         ]
         input_item_ids: list[str] = []
         response_ids: list[str] = []
