@@ -8,6 +8,7 @@ import sys
 import types
 from dataclasses import fields, replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from pydantic.fields import FieldInfo
@@ -19,6 +20,7 @@ from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.engine.arg_utils import EngineArgs
+from vllm.model_executor.models.utils import extract_layer_index
 
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.config.omni_config import (
@@ -29,6 +31,7 @@ from vllm_omni.config.omni_config import (
     OmniStageSchedulerConfig,
     VllmOmniARStageConfig,
     VllmOmniConfig,
+    extract_diffusion_stage_config_kwargs,
 )
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
@@ -50,6 +53,7 @@ from vllm_omni.engine.stage_init_utils import (
     build_engine_args_dict_from_omni_stage_config,
     build_legacy_engine_args_dict,
 )
+from vllm_omni.model_executor.models.gepard.pipeline import GEPARD_PIPELINE
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -60,9 +64,14 @@ _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
 def _effective_backend_values(config_cls: type, engine_args: dict) -> dict[str, object]:
     backend_fields = fields(config_cls)
     backend_field_names = {backend_field.name for backend_field in backend_fields}
-    backend_config = config_cls(
-        **{name: copy.deepcopy(value) for name, value in engine_args.items() if name in backend_field_names}
-    )
+    # This is a schema/normalization comparison, not a Hub download test.
+    with (
+        patch("vllm.engine.arg_utils.get_model_path", side_effect=lambda model, *_: model),
+        patch("vllm_omni.diffusion.data.get_model_path", side_effect=lambda model, *_: model),
+    ):
+        backend_config = config_cls(
+            **{name: copy.deepcopy(value) for name, value in engine_args.items() if name in backend_field_names}
+        )
     effective_values: dict[str, object] = {}
     for backend_field in backend_fields:
         value = getattr(backend_config, backend_field.name)
@@ -77,6 +86,9 @@ _DIFFUSION_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniDiffusi
 _TOPOLOGY_ONLY_ENGINE_ARGS = frozenset({"inline_diffusion"})
 _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
     {
+        "final_output",
+        "use_v2_model_runner",
+        "supports_native_mrv2_data_plane",
         "active_stream_window",
         "codec_frame_rate_hz",
         "custom_voice_dir",
@@ -95,6 +107,7 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "num_weight_load_threads",
         "omni_kv_config",
         "parallel_config",
+        "pooling_output_decoder",
         "silence_ban_frames",
         "subtalker_sampling_params",
         "task_type",
@@ -366,6 +379,21 @@ def test_typed_llm_projection_does_not_emit_inherited_upstream_defaults():
     assert inherited_defaults.isdisjoint(engine_args)
 
 
+def test_typed_llm_projection_omits_diffusion_only_and_process_only_defaults():
+    stage_config = VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test"),
+    )
+
+    engine_args = stage_init_utils._project_omni_stage_engine_args(stage_config)
+
+    assert {
+        "enable_multithread_weight_load",
+        "num_weight_load_threads",
+        "disable_autocast",
+        "log_level",
+    }.isdisjoint(engine_args)
+
+
 def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda _engine_args: None)
 
@@ -378,7 +406,9 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
     )
 
     assert deploy.stages[0].engine_extras["kv_cache_dtype"] == "fp8_e4m3"
+    assert deploy.stages[0].engine_extras["kv_cache_dtype_skip_layers"] == ["0"]
     assert "kv_cache_dtype" not in deploy.stages[1].engine_extras
+    assert "kv_cache_dtype_skip_layers" not in deploy.stages[1].engine_extras
 
     legacy_args = [build_legacy_engine_args_dict(stage, "test-model") for stage in legacy_stages]
     typed_args = [
@@ -394,14 +424,22 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
 
     assert ar_stage.stage_pipeline_config.execution_type == StageExecutionType.LLM_AR
     assert legacy_args[0]["kv_cache_dtype"] == "fp8_e4m3"
+    assert legacy_args[0]["kv_cache_dtype_skip_layers"] == ["0"]
     assert ar_stage.cache_config.cache_dtype == "fp8_e4m3"
+    assert ar_stage.cache_config.kv_cache_dtype_skip_layers == ["0"]
     assert "cache_dtype" in ar_stage.cache_config._omni_explicit_fields
     assert typed_args[0]["kv_cache_dtype"] == "fp8_e4m3"
+    assert typed_args[0]["kv_cache_dtype_skip_layers"] == ["0"]
+    # vLLM matches the list against the index it parses from each attention prefix.
+    assert str(extract_layer_index("ar.language_model.layers.0.self_attn.attn")) == "0"
 
     assert "kv_cache_dtype" not in legacy_args[1]
+    assert "kv_cache_dtype_skip_layers" not in legacy_args[1]
     assert dit_stage.cache_config.cache_dtype == "auto"
+    assert dit_stage.cache_config.kv_cache_dtype_skip_layers == []
     assert "cache_dtype" not in dit_stage.cache_config._omni_explicit_fields
     assert "kv_cache_dtype" not in typed_args[1]
+    assert "kv_cache_dtype_skip_layers" not in typed_args[1]
 
 
 def test_typed_llm_projection_rejects_explicit_fields_owned_by_another_boundary():
@@ -551,7 +589,9 @@ def test_engine_args_consume_stage_diffusion_attention_shorthand(tmp_path):
         assert engine_args.get("diffusion_attention_backend") is None
         assert isinstance(engine_args["diffusion_attention_config"], AttentionConfig)
         assert engine_args["diffusion_attention_config"].default.backend == "TORCH_SDPA"
-        od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
+        od_config = OmniDiffusionConfig.from_kwargs(
+            **extract_diffusion_stage_config_kwargs(engine_args, stage_id=2, include_engine_adapter_metadata=True)
+        )
         assert od_config.diffusion_attention_config.default.backend == "TORCH_SDPA"
 
 
@@ -584,7 +624,9 @@ def test_engine_args_apply_cli_attention_shorthand_over_yaml_config(tmp_path, ya
         attention_config = engine_args["diffusion_attention_config"]
         assert attention_config.default.backend == "TORCH_SDPA"
         assert attention_config.per_role["cross"].backend == "SAGE_ATTN"
-        od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
+        od_config = OmniDiffusionConfig.from_kwargs(
+            **extract_diffusion_stage_config_kwargs(engine_args, stage_id=2, include_engine_adapter_metadata=True)
+        )
         assert od_config.diffusion_attention_config.default.backend == "TORCH_SDPA"
 
 
@@ -843,3 +885,74 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type, 
         assert typed_effective_args == legacy_effective_args, (
             f"{model_type} stage {stage_id} changed effective backend arguments"
         )
+
+
+def test_stage_pipeline_config_defaults_recompute_preemption_to_allow() -> None:
+    stage = StagePipelineConfig(stage_id=0, model_stage="test")
+    assert stage.recompute_preemption == "allow"
+
+
+@pytest.mark.parametrize(
+    ("model_type", "stage_ids"),
+    [
+        ("gepard", (0,)),
+        ("voxcpm2", (0,)),
+        ("moss_tts_nano", (0,)),
+        ("qwen3_tts", (0,)),
+        ("aura_omni", (2,)),
+        ("minimax_music3", (0,)),
+        ("fish_qwen3_omni", (0,)),
+        ("personaplex", (0,)),
+        ("moss_tts_delay", (0,)),
+        ("moss_tts_realtime", (0,)),
+        ("moss_tts_local", (0,)),
+        ("nemotron_voicechat", (1,)),
+        ("voxtral_tts", (0,)),
+        ("higgs_audio_v2", (0,)),
+        ("higgs_multimodal_qwen3", (0,)),
+        ("ming_tts", (0,)),
+        ("ming_tts_moe", (0,)),
+        ("mimo_audio", (0,)),
+        ("qwen3_omni_moe", (1,)),
+        ("qwen2_5_omni", (1,)),
+    ],
+)
+def test_native_ar_tts_pipelines_declare_fail_recompute_preemption(model_type, stage_ids) -> None:
+    # qwen3_omni_moe is a resolver: without HF config it returns None.
+    hf_config = Qwen3OmniMoeConfig(enable_audio_output=True) if model_type == "qwen3_omni_moe" else None
+    pipeline = resolve_pipeline_config(model_type, hf_config)
+    assert pipeline is not None
+    for stage_id in stage_ids:
+        stage = pipeline.get_stage(stage_id)
+        assert stage is not None
+        assert stage.recompute_preemption == "fail"
+
+
+def test_gepard_deploy_merge_projects_fail_recompute_preemption() -> None:
+    deploy = load_deploy_config(_DEPLOY_DIR / "gepard.yaml")
+    merged = merge_pipeline_deploy(GEPARD_PIPELINE, deploy)
+    assert merged[0].yaml_engine_args["recompute_preemption"] == "fail"
+
+
+def test_deploy_engine_extras_cannot_override_recompute_preemption() -> None:
+    gepard_deploy = load_deploy_config(_DEPLOY_DIR / "gepard.yaml")
+    gepard_deploy.stages[0].engine_extras["recompute_preemption"] = "allow"
+    merged_gepard = merge_pipeline_deploy(GEPARD_PIPELINE, gepard_deploy)
+    assert merged_gepard[0].yaml_engine_args["recompute_preemption"] == "fail"
+
+
+@pytest.mark.parametrize("source", ["direct", "stage-overrides"])
+def test_stage_runtime_overrides_cannot_override_recompute_preemption(source: str) -> None:
+    """``--stage-overrides '{"0": {"recompute_preemption": "allow"}}'`` becomes
+    ``stage_0_recompute_preemption`` and is applied in ``to_omegaconf()`` after
+    topology projection. The fail declaration must still win.
+    """
+    gepard_deploy = load_deploy_config(_DEPLOY_DIR / "gepard.yaml")
+    merged = merge_pipeline_deploy(GEPARD_PIPELINE, gepard_deploy)
+    if source == "direct":
+        runtime_overrides = {"recompute_preemption": "allow"}
+    else:
+        runtime_overrides = build_stage_runtime_overrides(0, {"stage_0_recompute_preemption": "allow"})
+    merged[0].runtime_overrides = runtime_overrides
+    cfg = merged[0].to_omegaconf()
+    assert cfg.engine_args.recompute_preemption == "fail"

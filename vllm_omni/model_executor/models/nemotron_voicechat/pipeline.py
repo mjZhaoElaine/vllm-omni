@@ -31,13 +31,11 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.nemotron_voicechat"
 NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
     model_type="nemotron_voicechat",
     model_arch="NemotronVoiceChatThinkerForConditionalGeneration",
-    duplex_runtime_extension=(
-        "vllm_omni.model_executor.models.nemotron_voicechat.duplex.runtime.NemotronVoiceChatDuplexRuntimeExtension"
-    ),
-    duplex_serving_adapter=(
-        "vllm_omni.model_executor.models.nemotron_voicechat.duplex.serving_adapter.NemotronVoiceChatServingRuntimeAdapter"
-    ),
-    duplex_control_enabled=True,
+    duplex_plugin=("vllm_omni.model_executor.models.nemotron_voicechat.duplex.plugin.NemotronVoiceChatDuplexPlugin"),
+    # Duplex is opt-in per deployment (``nemotron_labs_voicechat_duplex.yaml``
+    # declares ``session_mode: duplex``); the bare/streaming deploys stay
+    # turn-based.
+    default_session_mode="turn",
     # Named after the alias key so the deploy-yaml stem substring-matches the
     # checkpoint directory name (NVIDIA-NemotronLabs-VoiceChat-11B) during
     # bare-path auto-detection.
@@ -74,6 +72,7 @@ NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
             async_chunk_process_next_stage_input_func=f"{_PROC}.talker2code2wav_async_chunk",
             sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
             sampling_constraints={"detokenize": False},
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=2,

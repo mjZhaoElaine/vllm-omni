@@ -21,7 +21,9 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.core.sched.omni_ar_scheduler import RECOMPUTE_PREEMPTION_FAIL_MESSAGE
 from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AbortResultMessage,
@@ -310,7 +312,7 @@ def _engine_core_outputs(tag: str, timestamp: float) -> SimpleNamespace:
     return SimpleNamespace(outputs=[tag], timestamp=timestamp, scheduler_stats=None, finished_requests=None)
 
 
-def _terminal_engine_core_outputs(request_id: str) -> EngineCoreOutputs:
+def _terminal_engine_core_outputs(request_id: str, timestamp: float = 1.0) -> EngineCoreOutputs:
     return EngineCoreOutputs(
         outputs=[
             EngineCoreOutput(
@@ -319,7 +321,7 @@ def _terminal_engine_core_outputs(request_id: str) -> EngineCoreOutputs:
                 finish_reason=FinishReason.STOP,
             )
         ],
-        timestamp=1.0,
+        timestamp=timestamp,
         finished_requests={request_id},
     )
 
@@ -332,6 +334,7 @@ def _build_request_output(
     finished: bool = True,
     text: str = "test",
     finish_reason: str | None = None,
+    stop_reason: str | None = None,
 ) -> RequestOutput:
     completion = CompletionOutput(
         index=0,
@@ -340,7 +343,7 @@ def _build_request_output(
         cumulative_logprob=0.0,
         logprobs=None,
         finish_reason=(finish_reason if finish_reason is not None else ("stop" if finished else None)),
-        stop_reason=None,
+        stop_reason=stop_reason,
     )
     return RequestOutput(
         request_id=request_id,
@@ -519,6 +522,7 @@ async def _enqueue_add_request(
     original_prompt,
     sampling_params_list,
     final_stage_id: int,
+    final_output_stage_ids: list[int] | None = None,
 ) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(
         StageSubmissionMessage(
@@ -529,6 +533,7 @@ async def _enqueue_add_request(
             output_prompt_text=None,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             preprocess_ms=0.0,
             request_timestamp=time.time(),
             enqueue_ts=time.perf_counter(),
@@ -788,6 +793,10 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
 
         stage1.push_engine_core_outputs(_engine_core_outputs("stage1-final", 3.0))
 
+        await _wait_for(
+            lambda: orchestrator_fixture.orchestrator.request_states["req-async"].pending_final_output is not None
+        )
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-final", 3.1))
         output_msg = await _get_output_message(orchestrator_fixture)
 
         assert output_msg.request_id == "req-async"
@@ -1414,6 +1423,105 @@ async def test_handle_streaming_update_unknown_request_is_dropped() -> None:
     assert "req-unknown" not in orchestrator.request_states
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_kv", [False, True])
+async def test_add_request_attaches_native_kv_ticket_before_dispatch(mocker, native_kv) -> None:
+    sampling = SamplingParams(extra_args={"keep": "sampling"})
+    prompt = SimpleNamespace(sampling_params=SamplingParams(extra_args={"keep": "prompt"}))
+    source = StagePool(
+        0,
+        FakeStageClient(),
+        stage_vllm_config=SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(kv_role="kv_producer") if native_kv else None
+        ),
+    )
+    target = StagePool(1, FakeStageClient(stage_type="diffusion", final_output=True))
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[source, target],
+    )
+
+    async def check_dispatch(request_id, req_state, request, **kwargs):
+        assert req_state.native_kv_transfer_id == ("xfer-req" if native_kv else None)
+        for params, preserved in ((sampling, "sampling"), (request.sampling_params, "prompt")):
+            assert params.extra_args["keep"] == preserved
+            if native_kv:
+                assert params.extra_args["kv_transfer_params"] == {
+                    "transfer_id": "xfer-req",
+                    "do_remote_decode": True,
+                    "do_remote_prefill": False,
+                }
+            else:
+                assert "kv_transfer_params" not in params.extra_args
+        return 0
+
+    dispatch = mocker.patch.object(source, "submit_initial", side_effect=check_dispatch)
+    await orchestrator._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id="req",
+            prompt=prompt,
+            original_prompt={},
+            output_prompt_text=None,
+            sampling_params_list=[sampling, OmniDiffusionSamplingParams()],
+            final_stage_id=1,
+            preprocess_ms=0,
+            request_timestamp=0,
+            enqueue_ts=0,
+        )
+    )
+    dispatch.assert_awaited_once()
+
+
+def test_native_handoff_uses_bound_replica_and_reports_missing_binding(mocker) -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [mocker.Mock()]
+    orchestrator.stage_pools[0].get_bound_client.return_value = None
+    req_state = SimpleNamespace(native_kv_transfer_id="xfer-req")
+    output = SimpleNamespace(kv_transfer_params={"num_transfer_tokens": 4})
+
+    with pytest.raises(NativeKVHandoffError, match="bound AR replica"):
+        orchestrator._diffusion_submit_kwargs("req", 0, SimpleNamespace(engine_input_source=[0]), req_state, output)
+    orchestrator.stage_pools[0].get_bound_client.assert_called_once_with("req")
+    # The pool default points at replica 0; this request actually used replica 1.
+    orchestrator.stage_pools[0].stage_vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(engine_id="ar-0")
+    )
+    config = SimpleNamespace(engine_id="ar-1", kv_connector_extra_config={"bootstrap_addr": "http://host:8999"})
+    orchestrator.stage_pools[0].get_bound_client.return_value = SimpleNamespace(
+        vllm_config=SimpleNamespace(kv_transfer_config=config)
+    )
+    params = orchestrator._diffusion_submit_kwargs(
+        "req", 0, SimpleNamespace(engine_input_source=[0]), req_state, output
+    )
+    assert params["kv_transfer_params"]["remote_engine_id"] == "ar-1"
+    assert params["kv_transfer_params"]["remote_bootstrap_addr"] == "http://host:8999"
+    assert "remote_engine_id" not in output.kv_transfer_params
+
+
+@pytest.mark.asyncio
+async def test_native_handoff_failure_is_request_scoped(mocker):
+    orchestrator = object.__new__(Orchestrator)
+    fail = mocker.patch.object(orchestrator, "_fail_request_client_error", new_callable=mocker.AsyncMock)
+
+    def lost_binding():
+        raise NativeKVHandoffError("bound AR replica is unavailable")
+
+    assert not await orchestrator._dispatch_or_fail_request(
+        lost_binding, req_id="req", stage_id=1, operation="inter-stage forward"
+    )
+    fail.assert_awaited_once_with(
+        "req",
+        1,
+        "bound AR replica is unavailable",
+        status_code=502,
+        error_type="NativeKVHandoffError",
+        release_owners=True,
+    )
+
+
 async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> None:
     class RecordingPool:
         def __init__(self) -> None:
@@ -1490,6 +1598,195 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
 
     assert pool.calls == [[output]]
     assert routed == [built_metrics]
+
+
+@pytest.mark.asyncio
+async def test_non_final_stage_error_finish_aborts_downstream_stages() -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=stage_pools,
+        async_chunk=True,
+    )
+    req_id = "req-fail"
+    orchestrator.request_states[req_id] = OrchestratorRequestState(
+        request_id=req_id,
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+    )
+    assert stage_pools[0].select_replica_id(req_id) == 0
+    assert stage_pools[1].select_replica_id(req_id) == 0
+
+    output = _build_request_output(
+        req_id,
+        finish_reason="error",
+        stop_reason=RECOMPUTE_PREEMPTION_FAIL_MESSAGE,
+    )
+
+    await orchestrator._handle_processed_outputs(0, 0, [output])
+
+    error = orchestrator.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.request_id == req_id
+    assert error.error == RECOMPUTE_PREEMPTION_FAIL_MESSAGE
+    assert stage0.abort_calls == [[req_id]]
+    assert stage1.abort_calls == [[req_id]]
+    assert req_id not in orchestrator.request_states
+
+
+@pytest.mark.asyncio
+async def test_visible_non_tail_stage_error_finish_aborts_downstream_stages() -> None:
+    """MiMo-shaped topology: stage 0 is client-visible and still has a downstream.
+
+    ``final_output`` means the stage emits user-visible content, not that it is
+    the pipeline tail. A fail-contract finish on stage 0 must abort stage 1.
+    """
+    stage0 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="text")
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=stage_pools,
+        async_chunk=True,
+    )
+    req_id = "req-mimo-fail"
+    orchestrator.request_states[req_id] = OrchestratorRequestState(
+        request_id=req_id,
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+        final_output_stage_ids={0, 1},
+    )
+    assert stage_pools[0].select_replica_id(req_id) == 0
+    assert stage_pools[1].select_replica_id(req_id) == 0
+
+    output = _build_request_output(
+        req_id,
+        finish_reason="error",
+        stop_reason=RECOMPUTE_PREEMPTION_FAIL_MESSAGE,
+    )
+
+    await orchestrator._handle_processed_outputs(0, 0, [output])
+
+    error = orchestrator.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.request_id == req_id
+    assert error.error == RECOMPUTE_PREEMPTION_FAIL_MESSAGE
+    assert stage0.abort_calls == [[req_id]]
+    assert stage1.abort_calls == [[req_id]]
+    assert req_id not in orchestrator.request_states
+
+
+@pytest.mark.asyncio
+async def test_final_stage_error_finish_routes_as_error() -> None:
+    """Tail fail-contract must be ErrorMessage, not a truncated OutputMessage."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=stage_pools,
+    )
+    req_id = "req-final"
+    orchestrator.request_states[req_id] = OrchestratorRequestState(
+        request_id=req_id,
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+        final_output_stage_ids={0},
+    )
+    assert stage_pools[0].select_replica_id(req_id) == 0
+
+    output = _build_request_output(
+        req_id,
+        finish_reason="error",
+        stop_reason=RECOMPUTE_PREEMPTION_FAIL_MESSAGE,
+    )
+
+    await orchestrator._handle_processed_outputs(0, 0, [output])
+
+    error = orchestrator.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.request_id == req_id
+    assert error.error == RECOMPUTE_PREEMPTION_FAIL_MESSAGE
+    assert stage0.abort_calls == [[req_id]]
+    assert req_id not in orchestrator.request_states
+    assert orchestrator.output_async_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_companion_fail_contract_error_aborts_parent() -> None:
+    """CFG companions have final_stage_id=0; implicit fail must still abort the parent."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=stage_pools,
+    )
+    parent_id = "req-parent"
+    companion_id = "req-parent-uncond"
+    orchestrator.request_states[parent_id] = OrchestratorRequestState(
+        request_id=parent_id,
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+        final_output_stage_ids={0},
+    )
+    orchestrator.request_states[companion_id] = OrchestratorRequestState(
+        request_id=companion_id,
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+        final_output_stage_ids={0},
+    )
+    orchestrator._cfg_tracker.register_companion(parent_id, "uncond", companion_id)
+    assert stage_pools[0].select_replica_id(parent_id) == 0
+    assert stage_pools[0].select_replica_id(companion_id) == 0
+
+    output = _build_request_output(
+        companion_id,
+        finish_reason="error",
+        stop_reason=RECOMPUTE_PREEMPTION_FAIL_MESSAGE,
+    )
+
+    await orchestrator._handle_processed_outputs(0, 0, [output])
+
+    error = orchestrator.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.request_id == parent_id
+    assert error.error == RECOMPUTE_PREEMPTION_FAIL_MESSAGE
+    aborted_ids = {rid for call in stage0.abort_calls for rid in call}
+    assert aborted_ids == {parent_id, companion_id}
+    assert parent_id not in orchestrator.request_states
+    assert companion_id not in orchestrator.request_states
+    assert orchestrator.output_async_queue.empty()
 
 
 def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
@@ -1892,6 +2189,47 @@ async def test_abort_retry_does_not_repeat_successful_stage_abort():
     assert first.physical_abort_calls == 1
     assert second.physical_abort_calls == 2
     assert second.bound == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_id", [0, 1])
+async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(mocker, stage_id):
+    pools = _build_stage_pools([[FakeStageClient()], [FakeStageClient()]])
+    for pool in pools:
+        mocker.patch.object(pool, "process_llm_raw_outputs", new_callable=mocker.AsyncMock, return_value=[])
+    output_queue: asyncio.Queue[ErrorMessage] = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=output_queue,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[],
+    )
+    orchestrator.stage_pools = pools
+    orchestrator.request_states["stuck"] = OrchestratorRequestState(request_id="stuck", final_stage_id=1)
+    mocker.patch.object(orchestrator, "_handle_kv_ready_raw_outputs", new_callable=mocker.AsyncMock)
+    cleanup = mocker.patch.object(orchestrator, "_cleanup_request_ids", new_callable=mocker.AsyncMock)
+    normal_terminal = mocker.patch.object(
+        orchestrator, "_apply_raw_terminal_stage_finish", new_callable=mocker.AsyncMock
+    )
+    reason = "Timed out waiting for connector input after 5s"
+    raw = EngineCoreOutputs(
+        outputs=[
+            OmniEngineCoreOutput(
+                request_id="stuck", new_token_ids=[], finish_reason=FinishReason.ERROR, stop_reason=reason
+            )
+        ]
+    )
+    terminal_ids: set[str] = set()
+
+    await orchestrator._process_llm_stage_outputs(stage_id, 0, raw, terminal_ids)
+
+    error = output_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert (error.request_id, error.stage_id, error.error) == ("stuck", stage_id, reason)
+    cleanup.assert_awaited_once_with(["stuck"], abort=True, release_owners=True)
+    normal_terminal.assert_not_awaited()
+    assert not terminal_ids
+    assert output_queue.empty()
 
 
 @pytest.mark.asyncio
