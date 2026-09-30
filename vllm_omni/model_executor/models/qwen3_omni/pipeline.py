@@ -80,9 +80,7 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
     ),
 )
 
-QWEN3_OMNI_MOE_DUPLEX_PLUGIN = (
-    "vllm_omni.model_executor.models.qwen3_omni.duplex.moe_plugin.Qwen3OmniDuplexPlugin"
-)
+QWEN3_OMNI_MOE_DUPLEX_PLUGIN = "vllm_omni.model_executor.models.qwen3_omni.duplex.moe_plugin.Qwen3OmniDuplexPlugin"
 
 # Turn-commit duplex: same Thinker→Talker→Code2Wav topology. Select with
 # ``pipeline: qwen3_omni_moe_duplex`` and ``session_mode: duplex``. The
