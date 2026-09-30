@@ -98,7 +98,7 @@ in the token/KV stream**. Declare `recompute_preemption="fail"` on the AR codec 
 | Signal | Example |
 |--------|---------|
 | Multi-codebook / multi-head sampling where only one code enters the token stream | Gepard (1/32 FSQ heads), Qwen3-TTS (`code_predictor` + `talker_mtp`) |
-| Next-step input built from side-channel tensors (`curr_embed_for_next`, composed embeddings, delay-pattern feedback) | VoxCPM2, dots.tts, MOSS-TTS |
+| Next-step input built from side-channel tensors (`curr_embed_for_next`, composed embeddings, delay-pattern feedback) | VoxCPM2, MOSS-TTS |
 | Per-request generator or codec state outside KV (`inference_stream()`, audio queues, precomputed stop logits) | MOSS-TTS-Nano, Higgs-Audio |
 | Diffusion / CFM / local depth decoders fed from hidden states rather than sampled tokens | Voxtral TTS, Ming TTS |
 
